@@ -1,21 +1,31 @@
 # ==============================================================================
 # Проект: Бортовий Комп'ютер для Audi 80 B3 Mono Motronic на Raspberry Pi Pico
-# Автор: tor4man
+# Автор: tor4man66
 # Файл: Main Logic (з функціоналом палива)
-# Дата оновлення: 2025-12-15
+# Опис: Основний програмний код бортового комп'ютера. Включає логіку
+#       збору даних з датчиків, розрахунків, керування станом двигуна,
+#       обробку помилок, зберігання персистентних даних, відображення
+#       інформації на OLED дисплеї, функціонал спеціального екрану
+#       та розширену логіку обробки кнопки.
+# Дата оновлення: 2026-01-14
 # ==============================================================================
 
 # -------------------------------------------------------------------------
 # 0. ІМПОРТ МОДУЛІВ
+#    Імпорт необхідних бібліотек для роботи з апаратним забезпеченням
+#    (піни, I2C, PWM, ADC), часом, файловою системою та графікою.
 # -------------------------------------------------------------------------
 from machine import Pin, I2C, disable_irq, enable_irq, PWM, ADC
 import time
 import framebuf
 import os
 
-import Settings
-import Icons
+# Імпорт кастомних модулів для налаштувань та іконок.
+import Settings # Містить всі калібрувальні константи та налаштування.
+import Icons    # Містить бітові мапи іконок для дисплея.
 
+# Спроба імпорту бібліотеки для OLED дисплея SH1107.
+# Якщо бібліотека не знайдена, дисплей буде вимкнено, і система продовжить працювати без нього.
 try:
     import sh1107
 except ImportError:
@@ -24,44 +34,60 @@ except ImportError:
 
 # -------------------------------------------------------------------------
 # 1. ФУНКЦІЇ ДЛЯ ГРАФІКИ (SH1107 EXTENSIONS)
+#    Розширення функціоналу бібліотеки sh1107 для підтримки розтягнутого
+#    тексту та прямокутників із заокругленими кутами.
 # -------------------------------------------------------------------------
-# Тимчасовий буфер для рендерингу окремих символів (8x8 пікселів)
+
+# Тимчасовий буфер для рендерингу окремих символів (8x8 пікселів).
+# Використовується для ефективного розтягування тексту на OLED.
 _temp_fb_char = None
-if sh1107:
+if sh1107: # Ініціалізуємо, тільки якщо драйвер дисплея доступний.
     try:
-        _temp_char_buffer = bytearray(8) # Буфер 8 байт для 8x8 монохромного символу (8*8/8=8)
+        # Буфер 8 байт для 8x8 монохромного символу (8*8/8=8 байт).
+        _temp_char_buffer = bytearray(8)
+        # FrameBuffer для роботи з цим буфером.
         _temp_fb_char = framebuf.FrameBuffer(_temp_char_buffer, 8, 8, framebuf.MONO_VLSB)
     except Exception as e:
         print(f"Помилка ініціалізації _temp_fb_char: {e}")
         _temp_fb_char = None
 
 def _draw_stretched_char(oled_obj, char, start_x, y, size_x, size_y, c=1):
-    """Малює один символ, розтягнутий до заданих розмірів."""
+    """
+    Малює один символ, розтягнутий до заданих розмірів (size_x, size_y).
+    Використовує _temp_fb_char для рендерингу символу, а потім малює розтягнуті
+    пікселі на основному OLED-буфері.
+    """
     if _temp_fb_char is None:
-        # Fallback: якщо тимчасовий буфер не ініціалізовано, малюємо стандартний текст
+        # Fallback: якщо тимчасовий буфер не ініціалізовано, малюємо стандартний текст.
         oled_obj.text(char, start_x, y, c)
-        return start_x + 8 # Повертаємо стандартну ширину символу
+        return start_x + 8 # Повертаємо стандартну ширину символу.
 
-    _temp_fb_char.fill(0) # Очищаємо буфер символу
-    _temp_fb_char.text(char, 0, 0, 1) # Малюємо символ у буфері
+    _temp_fb_char.fill(0) # Очищаємо буфер символу.
+    _temp_fb_char.text(char, 0, 0, 1) # Малюємо символ у тимчасовому буфері.
 
-    # Проходимо по пікселях 8x8 буфера та малюємо розтягнуті прямокутники на OLED
+    # Проходимо по пікселях 8x8 буфера символу та малюємо розтягнуті прямокутники на OLED.
     for dy in range(8):
         for dx in range(8):
-            if _temp_fb_char.pixel(dx, dy):
+            if _temp_fb_char.pixel(dx, dy): # Якщо піксель у символі активний...
+                # ...малюємо відповідний розтягнутий прямокутник на дисплеї.
                 oled_obj.fill_rect(start_x + dx * size_x, y + dy * size_y, size_x, size_y, c)
-    return start_x + 8 * size_x # Повертаємо позицію для наступного символу
+    return start_x + 8 * size_x # Повертаємо позицію для наступного символу.
 
 def stretched_text_optimized(self, s, x, y, size_x, size_y, c=1):
-    """Малює рядок тексту, розтягнутий по X та Y осях."""
+    """
+    Малює рядок тексту, розтягнутий по X та Y осях за допомогою _draw_stretched_char.
+    """
     current_x = x
     for char in s:
         current_x = _draw_stretched_char(self, char, current_x, y, size_x, size_y, c)
 
 def draw_frame_rect_with_rounded_corners(self, x, y, w, h, r, c=1):
-    """Малює прямокутник з заокругленими кутами (товщина 1px, r - радіус).
-    Примітка: При r=2 малюються лише 8 кутових пікселів для мінімального заокруглення.
-    Для більших радіусів r ця функція не малює повних дуг, а лише кутові пікселі.
+    """
+    Малює прямокутник з заокругленими кутами (товщина 1px, r - радіус).
+    Примітка: Поточна реалізація для r > 1 малює лише 8 кутових пікселів, що дає мінімальне
+    заокруглення, а не повні дуги. Для справжнього заокруглення (як на більших радіусах)
+    потрібно реалізувати алгоритм малювання чверті кола або розширити цю функцію, що
+    може бути ресурсоємним для мікроконтролера.
     """
     # 1. Малюємо чотири прямі секції, зупиняючись за r пікселів до кута.
     self.hline(x + r, y, w - 2 * r, c)           # Верхня лінія
@@ -69,97 +95,174 @@ def draw_frame_rect_with_rounded_corners(self, x, y, w, h, r, c=1):
     self.vline(x, y + r, h - 2 * r, c)           # Ліва лінія
     self.vline(x + w - 1, y + r, h - 2 * r, c)   # Права лінія
 
-    # 2. Малюємо 8 кутових пікселів (для r=2)
-    # TL: (x+r-1, y), (x, y+r-1)
+    # 2. Малюємо 8 кутових пікселів (для мінімального заокруглення при r=2)
+    # Зверху-ліва частина кута
     self.pixel(x + r - 1, y, c)
     self.pixel(x, y + r - 1, c)
 
-    # TR: (x+w-r, y), (x+w-1, y+r-1)
+    # Зверху-права частина кута
     self.pixel(x + w - r, y, c)
     self.pixel(x + w - 1, y + r - 1, c)
 
-    # BL: (x+r-1, y+h-1), (x, y+h-r)
+    # Знизу-ліва частина кута
     self.pixel(x + r - 1, y + h - 1, c)
     self.pixel(x, y + h - r, c)
 
-    # BR: (x+w-r, y+h-1), (x+w-1, y+h-r)
+    # Знизу-права частина кута
     self.pixel(x + w - r, y + h - 1, c)
     self.pixel(x + w - 1, y + h - r, c)
 
+# Якщо драйвер sh1107 та тимчасовий буфер ініціалізовані, додаємо нові методи до об'єкта OLED.
 if sh1107 and _temp_fb_char:
     sh1107.SH1107_I2C.stretched_text = stretched_text_optimized
 
     def large_text_wrapper(self, s, x, y, size, c=1):
+        """Обгортка для stretched_text_optimized, щоб спростити виклик для квадратних символів."""
         stretched_text_optimized(self, s, x, y, size, size, c)
     sh1107.SH1107_I2C.large_text = large_text_wrapper
     sh1107.SH1107_I2C.round_rect = draw_frame_rect_with_rounded_corners
 
 # -------------------------------------------------------------------------
 # 2. ВИЗНАЧЕННЯ ГРУП ПОМИЛОК
+#    Список текстів помилок, які мають викликати звуковий сигнал
+#    та вважатися критичними.
 # -------------------------------------------------------------------------
-# Всі активні помилки викликають звуковий сигнал і попередження.
-# Цей список містить ТЕКСТИ всіх помилок, які мають викликати звук та відображатися.
+# Всі активні помилки, тексти яких є в цьому списку, викликають звуковий сигнал
+# та відображаються як критичні попередження.
 ALL_SOUND_TRIGGERING_ERROR_TEXTS = [
-    Icons.ERROR_ICONS['LOW_OIL']['text'],
-    Icons.ERROR_ICONS['OVERHEAT']['text'], # Об'єднана іконка для перегріву та низького рівня охолоджувальної рідини
-    Icons.ERROR_ICONS['BRAKE_FLUID']['text'],
-    Icons.ERROR_ICONS['OIL_PRESSURE_HIGH']['text'],
+    Icons.ERROR_ICONS['0_3_AND_1_8_PRESSURE_OIL']['text'],           # Низький тиск мастила (0.3 бар)
+    Icons.ERROR_ICONS['OVERHEAT_AND_LOW_COOLANT']['text'],          # Перегрів двигуна / Низький рівень охолоджувальної рідини
+    Icons.ERROR_ICONS['BRAKE_FLUID']['text'],       # Низький рівень гальмівної рідини
+    Icons.ERROR_ICONS['0_3_AND_1_8_PRESSURE_OIL']['text'], # Низький тиск мастила (1.8 бар)
 ]
 
 # -------------------------------------------------------------------------
 # 3. ГЛОБАЛЬНІ ЗМІННІ СТАНУ
+#    Тут оголошуються всі глобальні змінні, які зберігають стан програми.
+#    Ці змінні можуть змінюватися як у головному циклі, так і в обробниках
+#    переривань (IRQ).
 # -------------------------------------------------------------------------
-total_pulse_time_us = 0 # Загальний час відкриття форсунки за інтервал (мкс)
-vss_pulse_count = 0     # Кількість імпульсів датчика швидкості за інтервал
-last_pulse_edge_us = 0  # Час останнього фронту сигналу форсунки (для розрахунку total_pulse_time_us)
-last_vss_pulse_us = 0   # Час останнього імпульсу VSS (для дебаунсингу)
-last_inj_start_us = 0   # Час початку останнього імпульсу форсунки (для розрахунку RPM)
-current_inj_period_us = 0 # Період імпульсів форсунки (для RPM)
-last_inj_activity_time_ms = time.ticks_ms() # Час останньої активності форсунки
-last_vss_activity_time_ms = time.ticks_ms() # Час останньої активності VSS
-engine_running_start_time_ms = 0 # Час запуску двигуна (для затримки перевірки тиску масла)
-trip_fuel_consumed_L = 0.0 # Накопичене паливо за поточну поїздку (TRIP)
-trip_distance_travelled_km = 0.0 # Пройдена відстань за поточну поїздку (TRIP)
-persistent_trip_fuel_L = 0.0 # Накопичене паливо за всю історію (PERS)
-persistent_trip_distance_km = 0.0 # Пройдена відстань за всю історію (PERS)
-last_persistent_save_time_ms = time.ticks_ms() # Час останнього збереження персистентних даних
-last_display_update_time = time.ticks_ms() # Час останнього оновлення дисплея
-blink_on = True # Статус блимання для попереджень
-last_blink_toggle_time_ms = time.ticks_ms() # Час останнього перемикання статусу блимання
-last_error_cycle_time_ms = time.ticks_ms() # Час останнього перемикання іконки помилки
-current_speaker_freq = 0 # Поточна частота динаміка
-current_speaker_duty = 0 # Поточна шпаруватість динаміка
-active_errors = [] # Список активних помилок для відображення
-current_error_display_index = 0 # Поточний індекс помилки в циклі відображення
-sensor_alarm_active = False # Чи активний звуковий сигнал тривоги
-alarm_phase = 0 # Поточна фаза звукового сигналу
-alarm_phase_start_time_ms = 0 # Час початку поточної фази сигналу
-_queued_errors_for_next_cycle = [] # Черга помилок для перемикання після завершення циклу
-file_error_count = 0 # Лічильник помилок файлової системи
+# Змінні для керування напругою.
+current_battery_voltage = 14.0 # Встановлюємо початкове значення напруги (14В — еталон для заведеного авто)
+blink_state = True # Змінна для блимання іконки напругию.
 
-# Змінні для датчика палива та його логіки
-fuel_level_adc = None # Об'єкт ADC для палива
-fuel_buffer = [0] * Settings.FUEL_BUFFER_SIZE # Буфер для згладжування значень палива
-last_smoothed_fuel_percent = 0.0 # Останнє згладжене значення палива
-last_fuel_update_time_ms = time.ticks_ms() # Час останнього оновлення палива
-is_low_fuel_active_by_hysteresis = False # Стан активації "Мало палива" з гістерезисом
-low_fuel_display_state = 0 # 0: Відображаємо LOW_FUEL, 1: Відображаємо Main Screen
-low_fuel_last_state_change_time_ms = time.ticks_ms() # Час останньої зміни стану відображення "Мало палива"
+
+# Змінні для керування DEAD TIME.
+dynamic_dead_time_us = Settings.INJ_DEAD_TIME_US # Присвоюємо змінній корекції базове значення з Settings.
+last_voltage_update_time_ms = time.ticks_ms() # Час останнього оновлення напруги (у мілісекундах).
+
+# Змінні для обробки сигналів форсунки та швидкості (оновлюються в IRQ).
+rpm = 0                    # Оберти двигуна (RPM), розраховані з імпульсів форсунки.
+total_pulse_time_us = 0    # Загальний час відкриття форсунки за інтервал (мкс). Використовується для розрахунку витрати палива.
+current_inj_period_us = 0  # Тривалість останнього імпульсу форсунки (мкс), щойно розрахована.
+vss_pulse_count = 0        # Кількість імпульсів датчика швидкості (VSS) за інтервал.
+last_pulse_edge_us = 0     # Час останнього фронту сигналу форсунки (для розрахунку тривалості імпульсу).
+last_vss_pulse_us = 0      # Час останнього імпульсу VSS (для дебаунсингу).
+last_inj_start_us = 0      # Час початку останнього імпульсу форсунки (для розрахунку RPM).
+last_inj_irq_time_us = 0   # Час останнього спрацювання IRQ форсунки (для дебаунсу IRQ).
+avg_inj_ms = 0.0  # Змінна для збереження згладженого значення для часу впорскування на спец екрані
+
+# Змінні для керування станом двигуна.
+is_engine_running = False  # Прапорець: True, якщо двигун працює (є активність форсунки).
+last_inj_activity_time_ms = time.ticks_ms() # Час останньої активності форсунки (для виявлення зупинки двигуна).
+last_vss_activity_time_ms = time.ticks_ms() # Час останньої активності VSS.
+engine_start_time_ms = 0   # Час (мс), коли двигун "схопив" (почав працювати). Використовується для затримки перевірки тиску масла.
+is_engine_running_stable = False # Прапорець: True, якщо двигун працює стабільно (RPM вище порогу).
+last_stable_rpm_time_ms = 0 # Час (мс), коли RPM востаннє був вище порогу стабільної роботи.
+
+# Змінні для статистики поїздок (TRIP та PERS).
+trip_fuel_consumed_L = 0.0          # Накопичене паливо за поточну поїздку (TRIP).
+trip_distance_travelled_km = 0.0    # Пройдена відстань за поточну поїздку (TRIP).
+persistent_trip_fuel_L = 0.0        # Накопичене паливо за всю історію (PERS).
+persistent_trip_distance_km = 0.0   # Пройдена відстань за всю історію (PERS).
+last_persistent_save_time_ms = time.ticks_ms() # Час останнього збереження персистентних даних на Flash.
+
+# Змінні для керування дисплеєм та інтерфейсом.
+current_display_mode = "MAIN"   # Поточний режим відображення: "MAIN", "ERROR_CYCLE", "LOW_FUEL_CYCLE", "SPECIAL_SCREEN".
+last_display_update_time = time.ticks_ms() # Час останнього оновлення дисплея.
+blink_on = True                 # Статус блимання для попереджень на екрані.
+last_blink_toggle_time_ms = time.ticks_ms() # Час останнього перемикання статусу блимання.
+
+# Змінні для обробки кнопки скидання/спец-екрану.
+button_trip_ready_beep_played = False # Прапорець, звук TRIP-вікна вже пролунав
+button_press_timer_start = 0        # Час (мс) початку утримання кнопки.
+button_trip_reset_candidate = False # Прапорець: True, якщо кнопку тримали достатньо довго для скидання TRIP, але не для спец-екрану.
+button_special_screen_triggered = False # Прапорець, що активація спец-екрану вже відбулася за це натискання.
+button_special_screen_beep_played = False # Прапорець, що подвійний сигнал для спец-екрану вже пролунав.
+
+# Змінні для обробки помилок та звукової сигналізації.
+active_errors = []              # Список активних помилок для відображення на екрані.
+current_error_display_index = 0 # Поточний індекс помилки в циклі відображення (якщо кілька помилок активні).
+last_error_cycle_time_ms = time.ticks_ms() # Час останнього перемикання іконки помилки на екрані.
+sensor_alarm_active = False     # Прапорець: True, якщо активний звуковий сигнал тривоги.
+alarm_phase = 0                 # Поточна фаза звукового сигналу (індекс у ALARM_SEQUENCE).
+alarm_phase_start_time_ms = 0   # Час початку поточної фази звукового сигналу.
+_queued_errors_for_next_cycle = [] # Черга помилок для перемикання після завершення поточного циклу відображення.
+file_error_count = 0            # Лічильник помилок файлової системи (для відображення на екрані).
+
+# Змінні для динаміка/зумера.
+current_speaker_freq = 0 # Поточна частота динаміка.
+current_speaker_duty = 0 # Поточна шпаруватість динаміка (0 = вимкнено, 32768 = 50%).
+
+# Змінні для датчика палива та його логіки.
+fuel_level_adc = None           # Об'єкт ADC для палива (ініціалізується пізніше).
+fuel_buffer = [0] * Settings.FUEL_BUFFER_SIZE # Буфер для згладжування значень рівня палива.
+last_smoothed_fuel_percent = 0.0 # Останнє згладжене значення палива (у відсотках).
+last_fuel_update_time_ms = time.ticks_ms() # Час останнього оновлення значення палива.
+is_low_fuel_active_by_hysteresis = False # Стан активації "Мало палива" з урахуванням гістерезису.
+low_fuel_display_state = 0      # 0: Відображаємо LOW_FUEL, 1: Відображаємо Main Screen (для спеціального циклу).
+low_fuel_last_state_change_time_ms = time.ticks_ms() # Час останньої зміни стану відображення "Мало палива".
+
+# Змінні для згладжування головного показника (L/H або L/100KM).
+main_val_buffer = [0.0] * Settings.MAIN_VAL_BUFFER_SIZE # Буфер для згладжування миттєвої витрати.
+last_display_unit = "L/H" # Для відстеження моменту перемикання режимів відображення L/H / L/100KM.
+
+# Змінні для спеціального екрану.
+special_screen_active_time_ms = 0 # Час (мс) активації спеціального екрану.
+
+wdt = None  # Об'єкт Watchdog (сторожовий таймер), ініціалізується пізніше.
 
 # -------------------------------------------------------------------------
 # 4. ІНІЦІАЛІЗАЦІЯ ПІНІВ
+#    Налаштування режимів роботи GPIO пінів (вхід/вихід, підтягування),
+#    а також ініціалізація периферійних пристроїв (PWM, ADC, Watchdog).
 # -------------------------------------------------------------------------
-INJ_PIN = Pin(Settings.PIN_INJ, Pin.IN, Pin.PULL_UP) # Вхід сигналу форсунки (Pin 0)
-VSS_PIN = Pin(Settings.PIN_VSS, Pin.IN, Pin.PULL_UP) # Вхід сигналу датчика швидкості (VSS) (Pin 1)
-RESET_BUTTON_PIN = Pin(Settings.PIN_BUTTON_RESET, Pin.IN, Pin.PULL_UP) # Кнопка скидання TRIP (Pin 2)
-BRAKE_FLUID_SENSOR_PIN = Pin(Settings.PIN_SENSOR_BRAKE_FLUID, Pin.IN, Pin.PULL_UP) # Датчик рівня гальмівної рідини (Pin 24)
-OIL_PRESSURE_LOW_SENSOR_PIN = Pin(Settings.PIN_SENSOR_OIL_PRESSURE_LOW, Pin.IN, Pin.PULL_UP) # Датчик низького тиску мастила (Pin 7)
-OVERHEAT_COOLANT_LEVEL_SENSOR_PIN = Pin(Settings.PIN_SENSOR_OVERHEAT_COOLANT_LEVEL, Pin.IN, Pin.PULL_UP) # Об'єднаний пін для датчиків перегріву двигуна та низького рівня охолоджувальної рідини (Pin 8)
-OIL_PRESSURE_HIGH_SENSOR_PIN = Pin(Settings.PIN_SENSOR_OIL_PRESSURE_HIGH, Pin.IN, Pin.PULL_UP) # Датчик високого тиску мастила (Pin 10)
-SPEAKER_PIN = Pin(Settings.PIN_SPEAKER, Pin.OUT) # Пін для динаміка/зумера (GPIO 12)
-pwm_speaker = None # Об'єкт PWM для динаміка
 
-# Ініціалізація ADC для датчика палива
+# Налаштування вхідних пінів з внутрішнім підтягуючим резистором (PULL_UP).
+# Це типово для датчиків, які "закорочують" пін на землю при спрацюванні (активний низький сигнал).
+INJ_PIN = Pin(Settings.PIN_INJ, Pin.IN, Pin.PULL_UP)
+VSS_PIN = Pin(Settings.PIN_VSS, Pin.IN, Pin.PULL_UP)
+RESET_BUTTON_PIN = Pin(Settings.PIN_BUTTON_RESET, Pin.IN, Pin.PULL_UP)
+BRAKE_FLUID_SENSOR_PIN = Pin(Settings.PIN_SENSOR_BRAKE_FLUID, Pin.IN, Pin.PULL_UP)
+OIL_PRESSURE_0_3_SENSOR_PIN = Pin(Settings.PIN_SENSOR_OIL_PRESSURE_0_3, Pin.IN, Pin.PULL_UP)
+OVERHEAT_AND_LOW_COOLANT_SENSOR_PIN = Pin(Settings.PIN_SENSOR_OVERHEAT_AND_LOW_COOLANT, Pin.IN, Pin.PULL_UP)
+OIL_PRESSURE_1_8_SENSOR_PIN = Pin(Settings.PIN_SENSOR_OIL_PRESSURE_1_8, Pin.IN, Pin.PULL_UP)
+
+# Ініціалізація піна ADC 12V
+voltage_adc = ADC(Pin(Settings.PIN_ADC))
+
+# Ініціалізація PWM для динаміка.
+# Динамік підключається до вихідного піна SPEAKE_PIN.
+try:
+    pwm_speaker = PWM(Pin(Settings.PIN_SPEAKER, Pin.OUT))
+    pwm_speaker.freq(1000) # Початкова частота 1000 Гц.
+    pwm_speaker.duty_u16(0) # Динамік вимкнено (0% шпаруватості).
+    current_speaker_duty = 0
+except Exception as e:
+    pwm_speaker = None
+    print(f"Помилка ініціалізації динаміка: {e}")
+
+# Ініціалізація Watchdog (сторожового таймера).
+# Watchdog перезавантажить мікроконтролер, якщо програма зависне (не "годуватиме" його).
+try:
+    import machine
+    wdt = machine.WDT(timeout=Settings.WATCHDOG_TIME_RESET)  # 8 секунд таймаут.
+    print(f"✅ Watchdog активовано ({Settings.WATCHDOG_TIME_RESET} ms)")
+except Exception as e:
+    print(f"⚠️ Watchdog помилка: {e}")
+
+# Ініціалізація ADC для датчика палива.
+# Аналоговий датчик рівня палива підключається до відповідного ADC піна.
 try:
     fuel_level_adc = ADC(Pin(Settings.PIN_FUEL_LEVEL_ADC))
 except Exception as e:
@@ -168,28 +271,124 @@ except Exception as e:
 
 # -------------------------------------------------------------------------
 # 5. СИСТЕМНІ ФУНКЦІЇ ТА ЛОГІКА
+#    Функції, що реалізують основну логіку роботи бортового комп'ютера.
 # -------------------------------------------------------------------------
 
-def _get_error_severity_level(error_list):
-    """Визначає рівень критичності списку помилок.
-    Рівні: 0 (немає помилок), 1 (некритична, без звуку), 3 (критична, зі звуком).
+def draw_batt_icon(oled, x, y, v_val, current_time_ms):
     """
-    if not error_list or error_list == [Icons.ERROR_ICONS['NONE']]: return 0
-    # Якщо є будь-яка критична помилка, повертаємо 3 (критична зі звуком)
-    if any(err['text'] in ALL_SOUND_TRIGGERING_ERROR_TEXTS for err in error_list): return 3
-    # Якщо є тільки "Мало палива", повертаємо 1 (некритична, без звуку)
-    if any(err['text'] == Icons.ERROR_ICONS['LOW_FUEL']['text'] for err in error_list): return 1
-    return 0
+    Відображення стану акумулятора.
+    """
+    # Умова для блимання:
+    # Якщо напруга менше 13.2 І зараз "фаза вимкнення" (кожні 500 мс) — виходимо з функції
+    if v_val < 13.2 and (current_time_ms // 1000) % 2 == 0:
+        return  # Нічого не малюємо, тому воно зникає (блимає)
+
+    # 1. Корпус акумулятора
+    oled.rect(x, y, 38, 26, 1)
+    oled.fill_rect(x + 5, y - 2, 4, 2, 1) # Клема
+    oled.fill_rect(x + 27, y - 2, 4, 2, 1) # Клема
+
+    # 3. Напруга всередині
+    v_str = "{:.1f}".format(v_val)
+    oled.stretched_text(v_str, x + 3, y + 6, 1, 2, 1)
+
+def update_voltage_correction():
+    global current_battery_voltage, dynamic_dead_time_us
+    """
+    Корекція DEAD TIME та розрахунок для відображення
+    """
+    # 1. Читаємо ADC (0-65535)
+    raw_v = voltage_adc.read_u16()
+
+    # Множимо на готовий коефіцієнт із Settings
+    current_battery_voltage = raw_v * Settings.VOLTAGE_CALIBRATION
+
+    # Корекція часу відкриття форсунки (Dead Time)
+    # Якщо напруга занадто мала (машина вимкнена), беремо 14В як базу
+    v_for_corr = current_battery_voltage if current_battery_voltage > 8.0 else 14.0
+    voltage_diff = 14.0 - v_for_corr
+
+    new_dt = Settings.INJ_DEAD_TIME_US + (voltage_diff * Settings.INJ_VOLT_SENSITIVITY)
+    # Обмежуємо, щоб не було помилок у розрахунках
+    dynamic_dead_time_us = int(max(0, min(500, new_dt)))
+
+def get_current_rpm_atomic():
+    """
+    Безпечно (атомарно) зчитує поточні оберти двигуна (rpm) з глобальної змінної.
+    Використання disable_irq/enable_irq запобігає race conditions, коли IRQ
+    може оновлювати змінну під час її зчитування головним циклом.
+    """
+    global rpm
+    irq_state = disable_irq() # Тимчасово відключаємо переривання.
+    current_rpm_value = rpm
+    enable_irq(irq_state)     # Знову вмикаємо переривання.
+    return current_rpm_value
+
+def get_current_inj_period_atomic():
+    """
+    Безпечно (атомарно) зчитує поточну тривалість імпульсу форсунки (current_inj_period_us).
+    Захист від race conditions під час доступу до змінної, що оновлюється в IRQ.
+    """
+    global current_inj_period_us
+    irq_state = disable_irq() # Тимчасово відключаємо переривання.
+    current_period_value = current_inj_period_us
+    enable_irq(irq_state)     # Знову вмикаємо переривання.
+    return current_period_value
+
+def play_single_beep(freq, duration_sec):
+    """Відтворює один звуковий сигнал заданої частоти та тривалості."""
+    global pwm_speaker, current_speaker_freq, current_speaker_duty
+    if pwm_speaker:
+        pwm_speaker.freq(freq)
+        pwm_speaker.duty_u16(32768) # 50% шпаруватості.
+        time.sleep(duration_sec)
+        pwm_speaker.duty_u16(0)
+        current_speaker_duty = 0
+        current_speaker_freq = 0
+
+def play_special_screen_beeps():
+    """Відтворює подвійний звуковий сигнал для активації спеціального екрану."""
+    global pwm_speaker
+    if pwm_speaker:
+        play_single_beep(Settings.BUTTON_SPECIAL_SCREEN_BEEP_FREQ_1, Settings.BUTTON_SPECIAL_SCREEN_BEEP_DURATION_1)
+        time.sleep(Settings.BUTTON_SPECIAL_SCREEN_BEEP_PAUSE_BETWEEN_SEC)
+        play_single_beep(Settings.BUTTON_SPECIAL_SCREEN_BEEP_FREQ_2, Settings.BUTTON_SPECIAL_SCREEN_BEEP_DURATION_2)
+
+
+def _get_error_severity_level(error_list):
+    """
+    Визначає рівень критичності списку помилок.
+    Рівні:
+    0: Немає помилок.
+    1: Некритична помилка (наприклад, "Мало палива"), без звукового сигналу.
+    3: Критична помилка (вимагає негайної уваги), зі звуковим сигналом.
+    """
+    if not error_list or error_list == [Icons.ERROR_ICONS['NONE']]:
+        return 0 # Немає помилок.
+
+    # Якщо є будь-яка критична помилка (текст якої є у ALL_SOUND_TRIGGERING_ERROR_TEXTS).
+    if any(err['text'] in ALL_SOUND_TRIGGERING_ERROR_TEXTS for err in error_list):
+        return 3 # Критична помилка.
+
+    # Якщо є тільки "Мало палива" (і немає критичних).
+    if any(err['text'] == Icons.ERROR_ICONS['LOW_FUEL']['text'] for err in error_list):
+        return 1 # Некритична помилка.
+
+    return 0 # Дефолт, якщо не підійшло жодне визначення.
 
 def manage_sensor_alarm():
-    """Керує послідовністю звукової тривоги відповідно до ALARM_SEQUENCE."""
+    """
+    Керує послідовністю звукової тривоги відповідно до ALARM_SEQUENCE,
+    визначеної в Settings.py.
+    """
     global sensor_alarm_active, alarm_phase, alarm_phase_start_time_ms
     global pwm_speaker, current_speaker_freq, current_speaker_duty
 
-    if pwm_speaker is None: return # Якщо динамік не ініціалізовано, нічого не робимо
+    if pwm_speaker is None:
+        return # Якщо динамік не ініціалізовано, нічого не робимо.
 
     if not sensor_alarm_active:
-        # Якщо тривога не активна, вимикаємо динамік і скидаємо фази
+        # Якщо тривога не активна, вимикаємо динамік і скидаємо фази.
         if current_speaker_duty != 0:
             pwm_speaker.duty_u16(0)
             current_speaker_duty = 0
@@ -198,31 +397,33 @@ def manage_sensor_alarm():
         return
 
     current_time_ms = time.ticks_ms()
-    if alarm_phase_start_time_ms == 0: alarm_phase_start_time_ms = current_time_ms # Ініціалізація часу початку фази
+    if alarm_phase_start_time_ms == 0:
+        alarm_phase_start_time_ms = current_time_ms # Ініціалізація часу початку першої фази.
 
+    # Отримуємо тривалість та частоту поточної фази з ALARM_SEQUENCE.
     phase_duration, phase_freq = Settings.ALARM_SEQUENCE[alarm_phase]
 
-    # Перевіряємо, чи потрібно перейти до наступної фази
+    # Перевіряємо, чи потрібно перейти до наступної фази.
     if time.ticks_diff(current_time_ms, alarm_phase_start_time_ms) >= phase_duration:
-        alarm_phase = (alarm_phase + 1) % len(Settings.ALARM_SEQUENCE) # Перехід до наступної фази
-        alarm_phase_start_time_ms = current_time_ms # Оновлюємо час початку нової фази
+        alarm_phase = (alarm_phase + 1) % len(Settings.ALARM_SEQUENCE) # Перехід до наступної фази (циклічно).
+        alarm_phase_start_time_ms = current_time_ms # Оновлюємо час початку нової фази.
 
+        # Встановлюємо динамік відповідно до нової фази.
         next_phase_duration, next_phase_freq = Settings.ALARM_SEQUENCE[alarm_phase]
         if next_phase_freq > 0:
-            # Встановлюємо нову частоту та вмикаємо динамік
             if current_speaker_freq != next_phase_freq:
                 pwm_speaker.freq(next_phase_freq)
                 current_speaker_freq = next_phase_freq
-            if current_speaker_duty != 32768:
+            if current_speaker_duty != 32768: # 50% шпаруватості для звуку.
                 pwm_speaker.duty_u16(32768)
                 current_speaker_duty = 32768
-        else:
-            # Вимикаємо динамік
+        else: # Якщо частота 0, вимикаємо динамік.
             if current_speaker_duty != 0:
                 pwm_speaker.duty_u16(0)
                 current_speaker_duty = 0
     elif phase_freq > 0:
-        # Якщо поточна фаза ще не завершилася і має звук, переконаємося, що динамік увімкнений з правильною частотою
+        # Якщо поточна фаза ще не завершилася і має звук, переконаємося,
+        # що динамік увімкнений з правильною частотою.
         if current_speaker_freq != phase_freq:
             pwm_speaker.freq(phase_freq)
             current_speaker_freq = phase_freq
@@ -231,49 +432,57 @@ def manage_sensor_alarm():
             current_speaker_duty = 32768
 
 def get_raw_fuel_percent():
-    """Зчитує сирі дані ADC та перетворює їх на відсотки рівня палива (0-100%)."""
+    """
+    Зчитує сирі дані з ADC датчика палива та перетворює їх на відсотки рівня палива (0-100%).
+    Використовує медіанний фільтр для підвищення стабільності показань.
+    """
     if fuel_level_adc is None:
-        return 0.0 # Якщо ADC не ініціалізовано, повертаємо 0%
+        return 0.0 # Якщо ADC не ініціалізовано, повертаємо 0%.
 
-    raw_adc_value = fuel_level_adc.read_u16() # Зчитуємо 16-бітне значення ADC
+    # Виконуємо кілька швидких зчитувань ADC для отримання більш стабільного значення
+    # та застосовуємо медіанний фільтр (беремо 4-те значення відсортованого списку).
+    readings = [fuel_level_adc.read_u16() for _ in range(8)]
+    raw_adc_value = sorted(readings)[3] # 4-те значення = медіана для 8 зчитувань.
 
-    # Перетворюємо сире значення ADC на відсотки
-    # Пропорція: (value - min) / (max - min)
+    # Перетворюємо сире значення ADC на відсотки за допомогою калібрувальних значень.
+    # Пропорція: (поточне_значення - мінімум) / (максимум - мінімум)
     adc_range = Settings.FUEL_ADC_MAX_RAW - Settings.FUEL_ADC_MIN_RAW
     if adc_range == 0:
-        return 0.0 # Запобігаємо діленню на нуль
+        return 0.0 # Запобігаємо діленню на нуль, якщо діапазон ADC не налаштовано.
 
     percent = (raw_adc_value - Settings.FUEL_ADC_MIN_RAW) / adc_range
-
-    percent = max(0.0, min(1.0, percent)) # Обмежуємо значення 0.0-1.0
-    return percent * 100.0 # Повертаємо відсотки (0-100)
+    percent = max(0.0, min(1.0, percent)) # Обмежуємо значення в діапазоні 0.0-1.0.
+    return percent * 100.0 # Повертаємо відсотки (0-100).
 
 def process_fuel_smoothing():
-    """Зчитує та згладжує рівень палива, застосовуючи обмеження швидкості зміни."""
+    """
+    Зчитує та згладжує рівень палива, застосовуючи обмеження швидкості зміни
+    для запобігання різким стрибкам показань.
+    """
     global fuel_buffer, last_smoothed_fuel_percent, last_fuel_update_time_ms
 
     current_time_ms = time.ticks_ms()
     time_diff_sec = time.ticks_diff(current_time_ms, last_fuel_update_time_ms) / 1000.0
-    # Запобігаємо діленню на 0, але також не застосовуємо обмеження швидкості зміни, якщо час не минув.
-    # Якщо time_diff_sec дуже мале, ставимо його в 1 секунду для розрахунку max_change,
-    # щоб обмеження не було занадто агресивним.
-    if time_diff_sec < (Settings.UPDATE_INTERVAL_SEC / 2.0): # Якщо минуло менше половини інтервалу, не обмежуємо сильно
+
+    # Визначаємо ефективний часовий інтервал для розрахунку максимальної зміни.
+    # Якщо time_diff_sec дуже мале, використовуємо UPDATE_INTERVAL_SEC, щоб
+    # обмеження швидкості зміни не було занадто агресивним.
+    if time_diff_sec < (Settings.UPDATE_INTERVAL_SEC / 2.0):
         effective_time_diff_sec = Settings.UPDATE_INTERVAL_SEC
     else:
         effective_time_diff_sec = time_diff_sec
 
-
     new_raw_percent = get_raw_fuel_percent()
 
-    # 1. Додаємо нове значення до буфера та видаляємо найстаріше
+    # 1. Додаємо нове значення до буфера та видаляємо найстаріше (FIFO).
     fuel_buffer.pop(0)
     fuel_buffer.append(new_raw_percent)
 
-    # 2. Обчислюємо середнє значення з буфера (згладжування)
+    # 2. Обчислюємо середнє значення з буфера (згладжування).
     current_smoothed_percent = sum(fuel_buffer) / len(fuel_buffer)
 
-    # 3. Обмежуємо швидкість зміни значення, тільки якщо пройшов достатній час
-    if time_diff_sec > 0: # Застосовуємо обмеження лише якщо пройшов час з останнього оновлення
+    # 3. Обмежуємо швидкість зміни значення, тільки якщо пройшов достатній час.
+    if time_diff_sec > 0:
         max_change = Settings.FUEL_MAX_PERCENT_CHANGE_PER_SEC * effective_time_diff_sec
         if current_smoothed_percent > last_smoothed_fuel_percent + max_change:
             current_smoothed_percent = last_smoothed_fuel_percent + max_change
@@ -286,189 +495,314 @@ def process_fuel_smoothing():
     return last_smoothed_fuel_percent
 
 def check_errors():
-    """Перевіряє стан всіх датчиків і повертає список АКТИВНИХ помилок, включаючи "Мало палива"."""
-    global engine_running_start_time_ms, current_inj_period_us
+    """
+    Перевіряє стан всіх підключених датчиків та рівень палива,
+    повертаючи список усіх АКТИВНИХ помилок.
+    Включає логіку затримки перевірки тиску масла та гістерезис для палива.
+    """
+    global engine_start_time_ms
     global is_low_fuel_active_by_hysteresis, last_smoothed_fuel_percent
+    global is_engine_running_stable
+    global last_stable_rpm_time_ms
 
-    found_errors = [] # Це список всіх знайдених помилок (критичних та некритичних)
+    found_errors = [] # Список для збору всіх знайдених помилок (критичних та некритичних).
     current_time_ms = time.ticks_ms()
 
-    # --- 0. Визначення статусу двигуна (перевірка RPM) ---
-    calculated_rpm = 0
-    if current_inj_period_us > 0:
-        calculated_rpm = Settings.RPM_CALCULATION_FACTOR // current_inj_period_us
-    is_injector_active = (time.ticks_diff(current_time_ms, last_inj_activity_time_ms) < 1000)
-    is_moving_fast = (time.ticks_diff(current_time_ms, last_vss_activity_time_ms) < 1000)
-    is_engine_running_stable = (is_injector_active and calculated_rpm > Settings.MIN_RPM_FOR_STABLE_RUNNING) or is_moving_fast
+    # Зчитуємо оберти двигуна атомарно, щоб уникнути race conditions з IRQ.
+    current_rpm_safe = get_current_rpm_atomic()
 
-    if is_engine_running_stable:
-        if engine_running_start_time_ms == 0:
-            engine_running_start_time_ms = current_time_ms
+    # --- 0. Перевірка стабільності двигуна ---
+    # Визначаємо, чи двигун працює стабільно, ґрунтуючись на RPM.
+    if current_rpm_safe > Settings.MIN_RPM_FOR_STABLE_RUNNING:
+        is_engine_running_stable = True
+        last_stable_rpm_time_ms = current_time_ms # Оновлюємо час, коли RPM був стабільним.
+        if engine_start_time_ms == 0:
+            engine_start_time_ms = current_time_ms # Фіксуємо час "схоплення" двигуна.
     else:
-        engine_running_start_time_ms = 0
+        # Якщо RPM впав, не скидаємо статус стабільності одразу, а чекаємо 2 секунди.
+        # Це запобігає хибним спрацьовуванням під час короткочасних просідань RPM.
+        if time.ticks_diff(current_time_ms, last_stable_rpm_time_ms) > 2000:
+            is_engine_running_stable = False
+            # engine_start_time_ms скидається в головному циклі при тривалій відсутності імпульсів форсунки.
 
     # --- 1. Критичні помилки (датчики) ---
-    if BRAKE_FLUID_SENSOR_PIN.value() == 0: found_errors.append(Icons.ERROR_ICONS['BRAKE_FLUID'])
-    if OVERHEAT_COOLANT_LEVEL_SENSOR_PIN.value() == 0: found_errors.append(Icons.ERROR_ICONS['OVERHEAT'])
-    if calculated_rpm > Settings.MIN_RPM_FOR_HIGH_PRESSURE_CHECK:
-        if OIL_PRESSURE_HIGH_SENSOR_PIN.value() == 1: found_errors.append(Icons.ERROR_ICONS['OIL_PRESSURE_HIGH'])
-    if OIL_PRESSURE_LOW_SENSOR_PIN.value() == 0:
-        if is_engine_running_stable and engine_running_start_time_ms != 0:
-            if time.ticks_diff(current_time_ms, engine_running_start_time_ms) > Settings.OIL_CHECK_DELAY_MS:
-                found_errors.append(Icons.ERROR_ICONS['LOW_OIL'])
+    # Датчики, які зазвичай активні низьким сигналом (0V) при проблемі.
+    if BRAKE_FLUID_SENSOR_PIN.value() == 0:
+        found_errors.append(Icons.ERROR_ICONS['BRAKE_FLUID'])
+    if OVERHEAT_AND_LOW_COOLANT_SENSOR_PIN.value() == 0:
+        found_errors.append(Icons.ERROR_ICONS['OVERHEAT_AND_LOW_COOLANT'])
+
+    # Датчик низького тиску масла (1.8 бар) перевіряється лише при певних RPM.
+    if current_rpm_safe > Settings.MIN_RPM_FOR_HIGH_PRESSURE_CHECK:
+        if OIL_PRESSURE_1_8_SENSOR_PIN.value() == 0:
+            found_errors.append(Icons.ERROR_ICONS['0_3_AND_1_8_PRESSURE_OIL'])
+
+    # Датчик низького тиску масла перевіряється лише після затримки після запуску двигуна
+    # та коли двигун працює стабільно.
+    if OIL_PRESSURE_0_3_SENSOR_PIN.value() == 0:
+        if is_engine_running_stable and engine_start_time_ms != 0:
+            if time.ticks_diff(current_time_ms, engine_start_time_ms) > Settings.OIL_CHECK_DELAY_MS:
+                found_errors.append(Icons.ERROR_ICONS['0_3_AND_1_8_PRESSURE_OIL'])
 
     # --- 2. Некритична помилка "Мало палива" (з гістерезисом) ---
-    # Оновлюємо згладжене значення палива
-
+    # Використовуємо гістерезис для стабільної активації/деактивації попередження.
     if is_low_fuel_active_by_hysteresis:
-        # Якщо попередження вже активне, вимикаємо його лише коли палива стане значно більше
+        # Якщо попередження вже активне, деактивуємо його лише коли палива стане значно більше.
         if last_smoothed_fuel_percent >= Settings.FUEL_HIGH_THRESHOLD_PERCENT:
             is_low_fuel_active_by_hysteresis = False
     else:
-        # Якщо попередження неактивне, активуємо його, коли палива стане менше порогового значення
+        # Якщо попередження неактивне, активуємо його, коли палива стане менше порогового значення.
         if last_smoothed_fuel_percent <= Settings.FUEL_LOW_THRESHOLD_PERCENT:
             is_low_fuel_active_by_hysteresis = True
 
     if is_low_fuel_active_by_hysteresis:
         found_errors.append(Icons.ERROR_ICONS['LOW_FUEL'])
 
+    # Якщо знайдені помилки, повертаємо їх список.
     if found_errors:
         return found_errors
 
-    return [Icons.ERROR_ICONS['NONE']] # Повертаємо "NONE", якщо помилок не знайдено
+    # Якщо помилок не знайдено, повертаємо спеціальну іконку "NONE".
+    return [Icons.ERROR_ICONS['NONE']]
 
 def load_persistent_data():
-    """Завантажує персистентні дані TRIP та PERS з файлу."""
+    """
+    Завантажує персистентні дані TRIP та PERS з файлу на Flash пам'яті.
+    Дані включають накопичене паливо та відстань для загального пробігу та поточної поїздки.
+    """
     global persistent_trip_fuel_L, persistent_trip_distance_km, trip_fuel_consumed_L, trip_distance_travelled_km, file_error_count
     try:
         with open(Settings.TRIP_DATA_FILE, 'r') as f:
             lines = f.readlines()
+            # Очікуємо 4 рядки: persistent fuel, persistent distance, trip fuel, trip distance.
             if len(lines) >= 4:
                 persistent_trip_fuel_L = float(lines[0].strip())
                 persistent_trip_distance_km = float(lines[1].strip())
                 trip_fuel_consumed_L = float(lines[2].strip())
                 trip_distance_travelled_km = float(lines[3].strip())
+            else:
+                # Якщо файл пошкоджений або неповний, ініціалізуємо нулями.
+                print("⚠️ Persistent data file incomplete, initializing with 0.")
+                persistent_trip_fuel_L = 0.0
+                persistent_trip_distance_km = 0.0
+                trip_fuel_consumed_L = 0.0
+                trip_distance_travelled_km = 0.0
     except Exception as e:
-        print(f"⚠️ Load persistent data error: {e}") # Додано дебаг вивід
+        # У випадку помилки при читанні файлу, ініціалізуємо нулями та збільшуємо лічильник помилок.
+        print(f"⚠️ Load persistent data error: {e}. Initializing with 0.")
+        persistent_trip_fuel_L = 0.0
+        persistent_trip_distance_km = 0.0
+        trip_fuel_consumed_L = 0.0
+        trip_distance_travelled_km = 0.0
         file_error_count += 1
 
 def save_persistent_data():
-    """Зберігає персистентні дані TRIP та PERS до файлу з певним інтервалом."""
+    """
+    Зберігає персистентні дані TRIP та PERS до файлу на Flash пам'яті
+    через певний інтервал часу, використовуючи атомарний механізм
+    (тимчасовий файл -> перейменування). Це запобігає пошкодженню файлу
+    у разі відключення живлення під час запису.
+    """
     global last_persistent_save_time_ms, file_error_count
     now = time.ticks_ms()
+    # Зберігаємо дані лише якщо минув достатній інтервал часу.
     if time.ticks_diff(now, last_persistent_save_time_ms) >= Settings.PERSISTENT_SAVE_INTERVAL_MS:
         try:
+            # 1. Записуємо дані в тимчасовий файл.
             with open(Settings.TRIP_DATA_TEMP, 'w') as f:
                 f.write(str(persistent_trip_fuel_L) + '\n')
                 f.write(str(persistent_trip_distance_km) + '\n')
                 f.write(str(trip_fuel_consumed_L) + '\n')
                 f.write(str(trip_distance_travelled_km) + '\n')
 
+            # 2. Видаляємо старий резервний файл (якщо існує).
             try: os.remove(Settings.TRIP_DATA_BACKUP)
-            except OSError: pass # Ігноруємо, якщо файлу немає
+            except OSError: pass # Ігноруємо, якщо файлу немає.
+
+            # 3. Перейменовуємо поточний файл даних в резервний.
             try: os.rename(Settings.TRIP_DATA_FILE, Settings.TRIP_DATA_BACKUP)
-            except OSError: pass # Ігноруємо, якщо файлу немає
+            except OSError: pass # Ігноруємо, якщо файлу немає.
+
+            # 4. Перейменовуємо тимчасовий файл в основний файл даних.
             os.rename(Settings.TRIP_DATA_TEMP, Settings.TRIP_DATA_FILE)
-            last_persistent_save_time_ms = now
+            last_persistent_save_time_ms = now # Оновлюємо час останнього збереження.
         except Exception as e:
-            print(f"⚠️ Save persistent data error: {e}") # Додано дебаг вивід
-            file_error_count += 1
+            # Обробка помилок файлової системи.
+            print(f"⚠️ Save persistent data error: {e}")
+            file_error_count += 1 # Збільшуємо лічильник помилок.
 
 def reset_persistent_trip():
-    """Автоматично скидає лічильники PERS, якщо досягнуто ліміту відстані."""
+    """
+    Автоматично скидає лічильники PERS (довгострокового пробігу та витрати),
+    якщо досягнуто ліміту відстані, визначеного в Settings.
+    Використовує атомарний механізм збереження.
+    """
     global persistent_trip_fuel_L, persistent_trip_distance_km, file_error_count
+    # Перевіряємо, чи досягнуто порогової відстані для скидання.
     if persistent_trip_distance_km >= Settings.RESET_PERSISTENT_TRIP_DISTANCE_KM:
         print(f"🔄 Reset persistent trip at {persistent_trip_fuel_L:.2f}L / {persistent_trip_distance_km:.2f}km")
+        # Скидаємо значення PERS.
         persistent_trip_fuel_L = 0.0
         persistent_trip_distance_km = 0.0
         try:
-            with open(Settings.TRIP_DATA_TEMP, 'w') as f: f.write("0.0\n0.0\n")
+            # Використовуємо той самий атомарний механізм збереження,
+            # щоб оновити файл з нульовими значеннями PERS.
+            with open(Settings.TRIP_DATA_TEMP, 'w') as f:
+                f.write(str(persistent_trip_fuel_L) + '\n')
+                f.write(str(persistent_trip_distance_km) + '\n')
+                # Важливо: також записуємо поточні значення TRIP, щоб їх не втратити.
+                f.write(str(trip_fuel_consumed_L) + '\n')
+                f.write(str(trip_distance_travelled_km) + '\n')
+
             try: os.remove(Settings.TRIP_DATA_BACKUP)
             except OSError: pass
             try: os.rename(Settings.TRIP_DATA_FILE, Settings.TRIP_DATA_BACKUP)
             except OSError: pass
             os.rename(Settings.TRIP_DATA_TEMP, Settings.TRIP_DATA_FILE)
         except OSError as e:
-            print(f"⚠️ Reset persistent trip file error: {e}") # Додано дебаг вивід
+            print(f"⚠️ Reset persistent trip file error: {e}")
             file_error_count += 1
 
 # -------------------------------------------------------------------------
-# 6. ОБРОБНИКИ ПЕРЕРИВАНЬ (IRQ)
+# 6. ОБРОБНИКИ ПЕРЕРИВАНЬ (IRQ - INTERRUPT REQUEST)
+#    Функції, які викликаються автоматично апаратним забезпеченням
+#    при зміні стану на вхідних пінах. Використовуються для точного
+#    та своєчасного збору даних.
 # -------------------------------------------------------------------------
 
 def injector_irq_handler(pin):
-    """Обробник переривання форсунки: Рахує витрату палива (ширина імпульсу) та RPM (період)."""
-    global total_pulse_time_us, last_pulse_edge_us, last_inj_activity_time_ms
-    global last_inj_start_us, current_inj_period_us
+    """
+    Обробник переривання для сигналу форсунки.
+    Визначає тривалість імпульсів форсунки для розрахунку витрати палива
+    та період між імпульсами для розрахунку обертів двигуна (RPM).
+    """
+    global last_pulse_edge_us, total_pulse_time_us, rpm, current_inj_period_us
+    global is_engine_running, last_inj_activity_time_ms
+    global last_inj_irq_time_us, last_inj_start_us
+    global dynamic_dead_time_us
 
-    current_time_us = time.ticks_us()
-    last_inj_activity_time_ms = time.ticks_ms()
+    # 🛡️ Атомарний блок: тимчасово відключаємо всі переривання,
+    # щоб забезпечити безпечний доступ до глобальних змінних, які
+    # також можуть бути використані в головному циклі.
+    irq_state = disable_irq()
+    try:
+        current_time_us = time.ticks_us()
+        pin_state = pin.value()
 
-    if pin.value() == 0: # FALLING EDGE
-        if last_inj_start_us != 0:
-            period = time.ticks_diff(current_time_us, last_inj_start_us)
-            if period > Settings.MIN_INJ_PERIOD_US:
-                current_inj_period_us = period
-        last_inj_start_us = current_time_us
+        # Дебаунс: ігноруємо спрацювання IRQ, якщо воно відбулося занадто швидко
+        # після попереднього, щоб фільтрувати електричний шум.
+        if time.ticks_diff(current_time_us, last_inj_irq_time_us) < 100:
+            return
+        last_inj_irq_time_us = current_time_us
 
-        if last_pulse_edge_us != 0:
-            total_pulse_time_us += time.ticks_diff(current_time_us, last_pulse_edge_us)
-        last_pulse_edge_us = current_time_us
+        # --- ОБРОБКА FALLING EDGE (імпульс форсунки ВКЛЮЧИВСЯ) ---
+        if pin_state == 0:
+            # 1. Розрахунок RPM (оберти двигуна).
+            # RPM розраховується з періоду між *початками* послідовних імпульсів форсунки.
+            if last_inj_start_us != 0: # Переконуємось, що це не перший імпульс після запуску/скидання.
+                period_between_pulses_us = time.ticks_diff(current_time_us, last_inj_start_us)
 
-    elif pin.value() == 1: # RISING EDGE
-        if last_pulse_edge_us != 0:
-            total_pulse_time_us += time.ticks_diff(current_time_us, last_pulse_edge_us)
-        last_pulse_edge_us = 0
+                # Фільтруємо період, щоб уникнути нереалістичних RPM (шум, дуже високі/низькі оберти).
+                if Settings.MIN_INJ_PERIOD_FOR_RPM_US < period_between_pulses_us < Settings.MAX_INJ_PERIOD_FOR_RPM_US:
+                    # Формула RPM: (мікросекунд_в_хвилині / період_мкс) / імпульсів_на_оберт.
+                    rpm_calculated = (Settings.RPM_BASE_FACTOR // period_between_pulses_us) // Settings.RPM_PULSES_PER_ENGINE_REVOLUTION
+
+                    # Додатковий фільтр для відображення RPM.
+                    if Settings.MIN_DISPLAY_RPM <= rpm_calculated <= Settings.MAX_DISPLAY_RPM:
+                        rpm = rpm_calculated
+                    else:
+                        rpm = 0 # Відкидаємо RPM, які виходять за межі очікуваного діапазону.
+                else:
+                    rpm = 0 # Період виходить за межі допустимого діапазону (може бути шум або зупинка).
+            else:
+                rpm = 0 # Якщо це перший імпульс, RPM ще не можна розрахувати.
+
+            last_inj_start_us = current_time_us # Зберігаємо час початку цього імпульсу для наступного розрахунку RPM.
+
+            # 2. Підготовка для розрахунку тривалості імпульсу.
+            last_pulse_edge_us = current_time_us # Зберігаємо час початку імпульсу.
+
+            # 3. Оновлення стану двигуна.
+            last_inj_activity_time_ms = time.ticks_ms() # Фіксуємо останню активність форсунки.
+            is_engine_running = True # Вказуємо, що двигун активно працює.
+
+        # --- ОБРОБКА RISING EDGE (імпульс форсунки ВИМКНУВСЯ) ---
+        elif pin_state == 1 and last_pulse_edge_us > 0:
+            # 1. Розрахунок тривалості імпульсу (ON-час форсунки).
+            raw_duration = time.ticks_diff(current_time_us, last_pulse_edge_us)
+
+            # Віднімаємо "мертву зону" форсунки та забезпечуємо мінімальну тривалість.
+            # Це коригує фактичний час, коли форсунка була фізично відкритою.
+            actual_duration = max(0, raw_duration - dynamic_dead_time_us)
+
+            # Фільтруємо занадто короткі/шумові імпульси за шириною (ON-час).
+            if actual_duration < Settings.MIN_INJ_PULSE_WIDTH_FILTER_US:
+                last_pulse_edge_us = 0 # Скидаємо, щоб уникнути подальших некоректних розрахунків.
+                return
+
+            # 2. Накопичення часу відкриття форсунок для розрахунку витрати палива.
+            total_pulse_time_us += actual_duration # Додаємо до загального часу відкриття форсунок.
+            current_inj_period_us = actual_duration # Зберігаємо тривалість останнього імпульсу (по суті, його ширину).
+
+            last_pulse_edge_us = 0 # Скидаємо для наступного розрахунку тривалості імпульсу.
+    finally:
+        enable_irq(irq_state) # 🛡️ Завершення атомарного блоку: знову вмикаємо переривання.
 
 def vss_irq_handler(pin):
-    """Обробник переривання датчика швидкості (VSS): Рахує кількість імпульсів."""
-    global vss_pulse_count, last_vss_activity_time_ms, last_vss_pulse_us
-    now = time.ticks_us()
+    """
+    Обробник переривання для датчика швидкості (VSS).
+    Підраховує імпульси VSS для розрахунку пройденої відстані та швидкості.
+    """
+    global vss_pulse_count, last_vss_pulse_us, last_vss_activity_time_ms
 
-    if time.ticks_diff(now, last_vss_pulse_us) > Settings.VSS_DEBOUNCE_US: # Використання константи з Settings
-        vss_pulse_count += 1
-        last_vss_activity_time_ms = time.ticks_ms()
-        last_vss_pulse_us = now
+    # 🛡️ Атомарний блок: захист спільних змінних.
+    irq_state = disable_irq()
+    try:
+        now = time.ticks_us()
+
+        # Дебаунс: ігноруємо спрацювання IRQ, якщо воно відбулося занадто швидко.
+        if time.ticks_diff(now, last_vss_pulse_us) > Settings.VSS_DEBOUNCE_US:
+            vss_pulse_count += 1
+            last_vss_activity_time_ms = time.ticks_ms() # Фіксуємо останню активність VSS.
+            last_vss_pulse_us = now
+    finally:
+        enable_irq(irq_state) # 🛡️ Завершення атомарного блоку.
 
 # -------------------------------------------------------------------------
 # 7. ІНІЦІАЛІЗАЦІЯ СИСТЕМИ
+#    Виконується один раз при запуску програми: налаштування OLED,
+#    первинне заповнення буферів, завантаження даних та початкова
+#    перевірка стану.
 # -------------------------------------------------------------------------
 
-oled_status = "OFF"
-oled = None
+oled_status = "OFF" # Початковий статус OLED дисплея.
+oled = None         # Об'єкт OLED дисплея.
+# Ініціалізація I2C шини.
 i2c = I2C(0, scl=Pin(Settings.PIN_I2C_SCL), sda=Pin(Settings.PIN_I2C_SDA), freq=Settings.I2C_FREQ)
 
-try:
-    pwm_speaker = PWM(SPEAKER_PIN)
-    pwm_speaker.freq(1000)
-    pwm_speaker.duty_u16(0)
-    current_speaker_duty = 0
-except Exception as e:
-    pwm_speaker = None
-    print(f"Помилка ініціалізації динаміка: {e}")
-
+# Ініціалізація OLED дисплея.
 if sh1107:
-    i2c_devices = i2c.scan()
-    if Settings.OLED_ADDR_HEX in i2c_devices:
+    i2c_devices = i2c.scan() # Скануємо I2C шину на наявність пристроїв.
+    if Settings.OLED_ADDR_HEX in i2c_devices: # Якщо OLED знайдено за адресою.
         try:
             oled = sh1107.SH1107_I2C(128, 128, i2c, address=Settings.OLED_ADDR_HEX, rotate=0)
             oled_status = "OK"
-            oled.contrast(Settings.OLED_CONTRAST)
+            oled.contrast(Settings.OLED_CONTRAST) # Встановлюємо контраст дисплея.
 
             # --- ІНІЦІАЛІЗАЦІЯ ЗГЛАДЖЕННЯ ПАЛИВА ---
-            # Заповнюємо буфер початковим значенням палива
+            # Заповнюємо буфер рівня палива початковим значенням.
             initial_fuel_percent = get_raw_fuel_percent()
             for i in range(Settings.FUEL_BUFFER_SIZE):
                 fuel_buffer[i] = initial_fuel_percent
             last_smoothed_fuel_percent = initial_fuel_percent
 
             # --- ПЕРВИННА ПЕРЕВІРКА ПОМИЛОК ПРИ ЗАПУСКУ ---
-            initial_full_errors = check_errors() # Отримуємо всі помилки (критичні та некритичні)
-            # Фільтруємо критичні помилки для прийняття рішення про показ STATUS_OK
+            initial_full_errors = check_errors() # Отримуємо всі помилки на старті.
+            # Фільтруємо критичні помилки, щоб вирішити, чи показувати екран STATUS_OK.
             initial_critical_errors = [err for err in initial_full_errors if err['text'] in ALL_SOUND_TRIGGERING_ERROR_TEXTS]
 
-            if not initial_critical_errors: # Якщо КРИТИЧНИХ помилок немає при старті
-                # Показуємо привітальний екран STATUS_OK
+            if not initial_critical_errors: # Якщо КРИТИЧНИХ помилок немає при старті.
+                # Показуємо привітальний екран STATUS_OK.
                 oled.fill(0)
                 if 'STATUS_OK' in Icons.ERROR_ICONS and Icons.ERROR_ICONS['STATUS_OK']['icon'] is not None:
                      fd = Icons.ERROR_ICONS['STATUS_OK']
@@ -476,14 +810,16 @@ if sh1107:
                      oled.blit(ok_icon_fb, fd['icon_pos'][0], fd['icon_pos'][1])
                 oled.show()
                 time.sleep(Settings.STARTUP_OK_SCREEN_DURATION_SEC)
-                active_errors = [Icons.ERROR_ICONS['NONE']] # Починаємо з чистого стану, далі логіка в циклі обробить
+                # Починаємо з чистого стану, далі логіка в циклі обробить реальні помилки.
+                active_errors = [Icons.ERROR_ICONS['NONE']]
+                current_display_mode = "MAIN" # Початковий режим відображення.
             else:
-                # Якщо є КРИТИЧНІ помилки, одразу показуємо їх
-                active_errors = initial_critical_errors[:] # Копіюємо знайдені критичні помилки
-                if 'WARNING' in Icons.ERROR_ICONS:
+                # Якщо є КРИТИЧНІ помилки, одразу показуємо їх.
+                active_errors = initial_critical_errors[:] # Копіюємо знайдені критичні помилки.
+                if 'WARNING' in Icons.ERROR_ICONS: # Додаємо загальну іконку попередження, якщо визначена.
                     active_errors.append(Icons.ERROR_ICONS['WARNING'])
 
-                # Активуємо звуковий сигнал для критичних помилок
+                # Активуємо звуковий сигнал для критичних помилок.
                 if pwm_speaker:
                     sensor_alarm_active = True
                     alarm_phase = 0
@@ -494,7 +830,7 @@ if sh1107:
                     current_speaker_freq = Settings.ALARM_SEQUENCE[0][1]
                     current_speaker_duty = 32768
 
-                # Відображаємо першу критичну помилку зі списку на старті
+                # Відображаємо першу критичну помилку зі списку на старті.
                 oled.fill(0)
                 icon_to_draw = active_errors[0]
                 if icon_to_draw['icon'] is not None:
@@ -502,63 +838,67 @@ if sh1107:
                     oled.blit(icon_fb, icon_to_draw['icon_pos'][0], icon_to_draw['icon_pos'][1])
                 oled.show()
                 time.sleep(Settings.STARTUP_ERROR_SCREEN_DURATION_SEC)
+                current_display_mode = "ERROR_CYCLE" # Початковий режим відображення.
         except Exception as e:
             print(f"Помилка ініціалізації OLED: {e}")
-            oled_status = "OFF"; oled = None
+            oled_status = "OFF"; oled = None # Вимикаємо OLED, якщо сталася помилка.
     else:
         print("OLED дисплей не знайдено.")
 else:
     print("Драйвер sh1107 відсутній.")
 
+# Реєстрація обробників переривань для пінів форсунки та датчика швидкості.
+# INJ_PIN: спрацьовує на обидва фронти (RISING | FALLING) для визначення тривалості імпульсу.
 INJ_PIN.irq(trigger=Pin.IRQ_RISING | Pin.IRQ_FALLING, handler=injector_irq_handler)
-VSS_PIN.irq(trigger=Pin.IRQ_RISING, handler=vss_irq_handler)
+# VSS_PIN: спрацьовує на FALLING EDGE (або RISING, залежить від датчика) для підрахунку імпульсів.
+VSS_PIN.irq(trigger=Pin.IRQ_FALLING, handler=vss_irq_handler)
 
-load_persistent_data()
-try: os.remove(Settings.TRIP_DATA_TEMP)
+load_persistent_data() # Завантажуємо накопичені дані поїздок з файлу.
+try: os.remove(Settings.TRIP_DATA_TEMP) # Видаляємо тимчасовий файл, якщо він залишився від попереднього запуску.
 except OSError: pass
 
-if oled_status == "OK" and oled: oled.fill(0); oled.show()
+if oled_status == "OK" and oled:
+    oled.fill(0); oled.show() # Очищаємо дисплей після початкових екранів.
 
 # -------------------------------------------------------------------------
 # 8. ЛОГІКА ВІДОБРАЖЕННЯ ЕКРАНІВ
+#    Функції, що відповідають за формування та оновлення зображення на OLED дисплеї.
 # -------------------------------------------------------------------------
 
-def draw_main_screen(oled_obj, current_distance_km_interval, current_volume_L_interval, current_speed_kmh, interval_sec):
-    """Малює головний екран: миттєва витрата, статистика TRIP/PERS.
-    Включає обчислення рамки навколо основного показника та одиниць.
+def draw_main_screen(oled_obj, current_distance_km_interval, current_volume_L_interval, current_speed_kmh, interval_sec, display_value=0.0):
+    """
+    Малює головний екран бортового комп'ютера:
+    Миттєва витрата палива (L/H або L/100KM) з рамкою,
+    статистика поточної поїздки (TRIP) та загальної (PERS),
+    а також лічильник файлових помилок.
     """
     global trip_fuel_consumed_L, trip_distance_travelled_km
     global persistent_trip_fuel_L, persistent_trip_distance_km
     global blink_on, file_error_count
 
     # --- 1. Розрахунок та відображення поточної витрати (L/H або L/100KM) ---
-    raw_volume_l_per_h = current_volume_L_interval / (interval_sec / 3600.0) if interval_sec > 0 else 0.0
+    raw_value = display_value # Використовуємо вже згладжене значення для відображення.
+
+    # Визначаємо, чи можна відображати L/100KM (потрібна мінімальна швидкість та відстань).
     can_show_l100km = (current_speed_kmh >= Settings.MIN_SPEED_FOR_L100KM_KMH) and \
                       (trip_distance_travelled_km >= Settings.MIN_DISTANCE_FOR_L100KM_KM)
 
-    raw_value = 0.0
-    if can_show_l100km:
-        raw_value = (current_volume_L_interval / current_distance_km_interval) * 100.0 if current_distance_km_interval > 0.0001 else 0.0
-        if raw_value > Settings.MAX_DISPLAY_L100KM_VALUE:
-            raw_value = 0.0
-    else:
-        raw_value = raw_volume_l_per_h
-
     value_str = ""
     text_size_main = Settings.MAIN_VALUE_FONT_SIZE
-    if raw_value < Settings.STATIONARY_THRESHOLD:
-        value_str = "-.--" # Порожній показник (4 символи)
-    elif raw_value >= 100.0 and not can_show_l100km:
-        value_str = "{: >4}".format("EEEE") # "NO" лише для L/H, форматуємо до 4 символів
-    else:
-        # УНІВЕРСАЛЬНЕ ФОРМАТУВАННЯ ДЛЯ ГОЛОВНОГО ПОКАЗНИКА (L/H АБО L/100KM)
-        # Забезпечує фіксовану ширину 4 символи та бажану кількість знаків після коми.
-        if raw_value < 10.0:
-            value_str = "{: >4.2f}".format(raw_value) # Наприклад: " 1.20"
-        else:
-            value_str = "{: >4.1f}".format(raw_value) # Наприклад: "12.3"
 
-    # Позиції та розміри основного значення
+    # Логіка відображення: "-.--" для стаціонарного стану, "EEEE" для перевищення ліміту.
+    if raw_value < Settings.STATIONARY_THRESHOLD:
+        value_str = "-.--"
+    elif raw_value > Settings.MAX_DISPLAY_L100KM_VALUE:
+        value_str = "EEEE"
+    else:
+        # Стандартне форматування для значень 0.00 - 99.9.
+        if raw_value < 10.0:
+            value_str = "{: >4.2f}".format(raw_value) # Наприклад: "1.23".
+        else:
+            value_str = "{: >4.1f}".format(raw_value) # Наприклад: "12.3".
+
+    # Розрахунок позиції та розміру основного значення для центрування.
     main_val_x_pos = (128 - len(value_str) * 8 * text_size_main) // 2 + Settings.MAIN_VALUE_X_OFFSET
     main_val_y_pos = Settings.MAIN_VALUE_Y_POS
     main_val_width = len(value_str) * 8 * text_size_main
@@ -567,17 +907,17 @@ def draw_main_screen(oled_obj, current_distance_km_interval, current_volume_L_in
     oled_obj.large_text(value_str, main_val_x_pos, main_val_y_pos, text_size_main, 1)
 
     # --- 2. Відображення одиниць виміру (L/H або L/100KM) ---
+
     unit_text = "L/H"
     if can_show_l100km:
-        unit_text = "L/100KM" # Повна одиниця виміру
+        unit_text = "L/100KM"
 
-    # Позиції та розміри одиниць виміру
+    # Розрахунок позиції та розміру одиниць виміру для центрування відносно основного значення.
     unit_text_size_x = Settings.MAIN_UNIT_FONT_SIZE_X
     unit_text_size_y = Settings.MAIN_UNIT_FONT_SIZE_Y
     unit_y_pos = main_val_y_pos + main_val_height + Settings.MAIN_UNIT_Y_OFFSET
-    unit_text_width = len(unit_text) * 8 * unit_text_size_x
+    unit_text_width = len(unit_text) * 2 * unit_text_size_x
     unit_text_height = 8 * unit_text_size_y
-    # Центруємо одиниці виміру відносно основного значення
     unit_x_pos = (128 - unit_text_width) // 2 + Settings.MAIN_VALUE_X_OFFSET
 
     oled_obj.stretched_text(unit_text, unit_x_pos, unit_y_pos, unit_text_size_x, unit_text_size_y, 1)
@@ -586,13 +926,13 @@ def draw_main_screen(oled_obj, current_distance_km_interval, current_volume_L_in
     padding = Settings.MAIN_FRAME_PADDING_PX
     radius = Settings.MAIN_FRAME_RADIUS_PX
 
-    # Обчислення об'єднаних границь
+    # Обчислення об'єднаних границь, які рамка повинна охоплювати.
     frame_x_min = min(main_val_x_pos, unit_x_pos)
     frame_x_max = max(main_val_x_pos + main_val_width, unit_x_pos + unit_text_width)
     frame_y_min = main_val_y_pos
     frame_y_max = unit_y_pos + unit_text_height
 
-    # Координати та розміри рамки з урахуванням відступу
+    # Координати та розміри рамки з урахуванням відступу (padding).
     frame_x = frame_x_min - padding
     frame_y = frame_y_min - padding
     frame_w = (frame_x_max - frame_x_min) + 2 * padding
@@ -603,38 +943,124 @@ def draw_main_screen(oled_obj, current_distance_km_interval, current_volume_L_in
     # --- 4. Статистика PERS (середня витрата L/100KM) ---
     avg_p_val = 0.0
     if persistent_trip_distance_km > Settings.MIN_PERS_DISPLAY_DISTANCE_KM:
+        # Розрахунок середньої витрати PERS.
         avg_p_val = (persistent_trip_fuel_L / persistent_trip_distance_km) * 100.0
 
+    # Форматування тексту для PERS.
     if avg_p_val > 0.0 and avg_p_val <= Settings.MAX_DISPLAY_L100KM_VALUE:
         pers_avg_str = "{:>{}.1f}".format(avg_p_val, Settings.PERS_L100KM_DISPLAY_WIDTH)
     else:
         pers_avg_str = "{:>{}}".format("----", Settings.PERS_L100KM_DISPLAY_WIDTH)
 
     pers_txt = "{} L/100KM".format(pers_avg_str)
-    oled_obj.stretched_text(pers_txt, Settings.STAT_TEXT_X_POS, Settings.PERS_STAT_Y_POS_FUEL_LESS, 1, 2)
+    oled_obj.stretched_text(pers_txt, Settings.STAT_TEXT_X_POS, Settings.PERS_STAT_Y_POS, 1, 2)
 
     # --- 5. Статистика TRIP (накопичені літри та кілометри) ---
+    # Форматування для палива TRIP.
     f_str_val = trip_fuel_consumed_L if trip_fuel_consumed_L > 0.05 else None
     f_str_display = "{:>{}.1f}".format(f_str_val, Settings.TRIP_FUEL_DISPLAY_WIDTH) if f_str_val is not None else "{:>{}}".format("----", Settings.TRIP_FUEL_DISPLAY_WIDTH)
 
+    # Форматування для відстані TRIP.
     d_str_val = int(trip_distance_travelled_km) if trip_distance_travelled_km > 0.1 else None
     d_str_display = "{:>{}.0f}".format(d_str_val, Settings.TRIP_DISTANCE_DISPLAY_WIDTH) if d_str_val is not None else "{:>{}}".format("---", Settings.TRIP_DISTANCE_DISPLAY_WIDTH)
 
     trip_txt = "{}L  {}KM".format(f_str_display, d_str_display)
-    oled_obj.stretched_text(trip_txt, Settings.STAT_TEXT_X_POS, Settings.TRIP_STAT_Y_POS_FUEL_LESS, 1, 2)
+    oled_obj.stretched_text(trip_txt, Settings.STAT_TEXT_X_POS, Settings.TRIP_STAT_Y_POS, 1, 2)
 
     # --- 6. Відображення лічильника файлових помилок (якщо є) ---
     if file_error_count > 0:
+        error_display_text = f"FE:{file_error_count}" # "FE" скорочено від "File Error".
+        text_w = len(error_display_text) * 8 # Стандартний шрифт 8px за шириною.
+        oled_obj.text(error_display_text, 128 - text_w - 4, 0, 1) # У верхньому правому куті.
+
+    # Викликаемо функцію відображення напруги.
+    draw_batt_icon(oled_obj, 7, 42, current_battery_voltage, time.ticks_ms())
+
+
+def draw_special_screen(oled_obj, speed_kmh, rpm_val, fuel_percent_val):
+    """
+    Малює спеціальний екран з поточною швидкістю, обертами двигуна та залишком палива.
+    """
+    global voltage_adc, file_error_count, avg_inj_ms
+
+    oled_obj.fill(0) # Очищаємо дисплей.
+
+    # 1. Швидкість (KMH)
+    speed_display = "---" if speed_kmh <= 0 else f"{int(speed_kmh):3d}"
+    speed_text = f"{speed_display}KMH"
+    oled_obj.stretched_text(speed_text, Settings.SP_SCR_SPEED_X, Settings.SP_SCR_SPEED_Y,
+                           Settings.SP_SCR_SPEED_FONT_SIZE, Settings.SP_SCR_SPEED_FONT_SIZE)
+
+    # 2. Напруга (V)
+    # current_battery_voltage оновлюється раз на секунду в Main Loop
+    voltage_display = "----" if current_battery_voltage <= 0.5 else f"{current_battery_voltage:.1f}"
+    voltage_text = f"{voltage_display}V"
+    oled_obj.stretched_text(voltage_text, Settings.SP_SCR_VOLTAGE_X, Settings.SP_SCR_VOLTAGE_Y,
+                           Settings.SP_SCR_VOLTAGE_FONT_SIZE, Settings.SP_SCR_VOLTAGE_FONT_SIZE)
+
+    # 3. Оберти двигуна (RPM)
+    rpm_display = "----" if rpm_val <= 0 else f"{int(rpm_val):4d}"
+    rpm_text = f"{rpm_display}RPM"
+    oled_obj.stretched_text(rpm_text, Settings.SP_SCR_RPM_X, Settings.SP_SCR_RPM_Y,
+                           Settings.SP_SCR_RPM_FONT_SIZE, Settings.SP_SCR_RPM_FONT_SIZE)
+
+    # 4. Залишок палива (L)
+    # Перевіряємо вхідний відсоток. Якщо він 0 або (якщо при старті він 100)
+    # додаємо перевірку, чи взагалі дані готові.
+    if fuel_percent_val <= 0.9:
+        fuel_display = "--"
+    else:
+        fuel_L = (fuel_percent_val / 100) * Settings.FUEL_TANK_CAPACITY_L
+        fuel_display = f"{int(fuel_L):2d}"
+
+    fuel_text = f"{fuel_display}L"
+    oled_obj.stretched_text(fuel_text, Settings.SP_SCR_FUEL_X, Settings.SP_SCR_FUEL_Y,
+                           Settings.SP_SCR_FUEL_FONT_SIZE, Settings.SP_SCR_FUEL_FONT_SIZE)
+
+    # 5. Час впорскування
+    # Отримуємо сире значення
+    inj_us = get_current_inj_period_atomic()
+    current_ms = inj_us / 1000.0
+    # Фільтрація (Згладжування)
+    # Коефіцієнт 0.2 означає, що нове значення на 20% впливає на результат.
+    # Це прибере "дрижання", але залишить швидку реакцію на газ.
+    if current_ms > 0:
+        if avg_inj_ms == 0:
+            avg_inj_ms = current_ms  # Перший запуск
+        else:
+            avg_inj_ms = (avg_inj_ms * 0.8) + (current_ms * 0.2)
+    else:
+        avg_inj_ms = 0.0
+    # Вивід на екран
+    inj_display = "----" if avg_inj_ms <= 0 else f"{avg_inj_ms:.2f}"
+    oled_obj.stretched_text(f"{inj_display}MS", Settings.SP_SCR_INJ_X, Settings.SP_SCR_INJ_Y, Settings.SP_SCR_INJ_FONT_SIZE, 2, 1)
+
+    # 6. Відображення лічильника файлових помилок (якщо є)
+    if file_error_count > 0:
         error_display_text = f"FE:{file_error_count}"
-        text_w = len(error_display_text) * 8 # Стандартний шрифт 8px
-        oled_obj.text(error_display_text, 108 - text_w, 0, 1) # У верхньому правому куті
+        text_w = len(error_display_text) * 8
+        oled_obj.text(error_display_text, 128 - text_w - 4, 0, 1)
+
+    oled_obj.show()
+
 
 def calculate_and_display(interval_sec=1):
-    """Основний цикл логіки: збір даних, розрахунки, обробка помилок та оновлення дисплея."""
+    """
+    Основний цикл логіки, що виконується періодично:
+    збір даних, розрахунки, обробка помилок та оновлення дисплея.
+    """
     global trip_fuel_consumed_L, trip_distance_travelled_km, persistent_trip_fuel_L, persistent_trip_distance_km
     global low_fuel_display_state, low_fuel_last_state_change_time_ms
+    global is_engine_running_stable
+    global wdt, current_display_mode, special_screen_active_time_ms
 
-    # Захист від переповнення лічильників TRIP згідно з MAX_TRIP_LITERS та MAX_TRIP_DISTANCE
+    global button_trip_reset_triggered, button_special_screen_triggered, button_special_screen_beep_played
+    global button_press_timer_start, current_error_display_index, last_error_cycle_time_ms
+
+    if wdt:
+        wdt.feed() # "Годуємо" Watchdog, щоб запобігти перезавантаженню.
+
+    # Захист від переповнення лічильників TRIP.
     if trip_fuel_consumed_L > Settings.MAX_TRIP_LITERS or trip_distance_travelled_km > Settings.MAX_TRIP_DISTANCE:
         trip_fuel_consumed_L = 0.0
         trip_distance_travelled_km = 0.0
@@ -645,230 +1071,392 @@ def calculate_and_display(interval_sec=1):
     global sensor_alarm_active, alarm_phase, alarm_phase_start_time_ms
     global current_speaker_freq, current_speaker_duty
     global _queued_errors_for_next_cycle
-    global current_inj_period_us
     global last_persistent_save_time_ms
     global file_error_count
 
     current_time_ms = time.ticks_ms()
 
-    # 1. Атомарне зчитування IRQ лічильників для уникнення race conditions
+    # 1. Атомарне зчитування IRQ лічильників.
+    # Відключаємо переривання, щоб безпечно прочитати змінні, які оновлюються в IRQ.
     state = disable_irq()
     pulses_to_process = vss_pulse_count
     pulse_time_to_process_us = total_pulse_time_us
-    current_inj_period_us_atomic = current_inj_period_us
-    vss_pulse_count = 0
+    vss_pulse_count = 0        # Скидаємо лічильники після зчитування.
     total_pulse_time_us = 0
-    enable_irq(state)
+    enable_irq(state)          # Знову вмикаємо переривання.
 
-    current_inj_period_us = current_inj_period_us_atomic
-
-    # 3. Розрахунки на основі зібраних даних
+    # 2. Розрахунки на основі отриманих даних.
+    # 2.1. Відстань, пройдена за останній інтервал.
     distance_km_current_interval = pulses_to_process / Settings.VSS_IMPULSES_PER_KM
-    FUEL_RATE_L_PER_US = Settings.INJ_FLOW_RATE_ML_PER_MIN / (1000 * 60 * 1_000_000)
-    volume_L_current_interval = pulse_time_to_process_us * FUEL_RATE_L_PER_US
-    current_speed_kmh = (distance_km_current_interval / (interval_sec / 3600.0))
 
-    # 4. Накопичення і збереження даних поїздок
+    # 2.2. Коефіцієнт перетворення часу імпульсу форсунки в літри.
+    # ML_PER_MIN -> L_PER_US
+    FUEL_RATE_L_PER_US = Settings.INJ_FLOW_RATE_ML_PER_MIN / (1000 * 60 * 1_000_000)
+
+    # 2.3. Об'єм палива, спожитий за останній інтервал.
+    # Паливо рахується лише, якщо двигун працює стабільно.
+    volume_L_current_interval = pulse_time_to_process_us * FUEL_RATE_L_PER_US if is_engine_running_stable else 0.0
+
+    # 2.4. Поточна швидкість (км/год).
+    current_speed_kmh = (distance_km_current_interval / (interval_sec / 3600.0)) if interval_sec > 0 else 0.0
+
+    # 2.5. Розрахунок "сирої" витрати для буфера згладжування (L/H або L/100KM).
+    raw_volume_l_per_h = volume_L_current_interval / (interval_sec / 3600.0) if interval_sec > 0 else 0.0
+
+    # Визначаємо, чи можна показувати L/100KM.
+    can_show_l100km = (current_speed_kmh >= Settings.MIN_SPEED_FOR_L100KM_KMH) and \
+                      (trip_distance_travelled_km >= Settings.MIN_DISTANCE_FOR_L100KM_KM)
+
+    temp_raw_val = 0.0
+    if can_show_l100km:
+        # L/100KM = (літри / кілометри) * 100
+        temp_raw_val = (volume_L_current_interval / distance_km_current_interval) * 100.0 if distance_km_current_interval > 0.0001 else 0.0
+    else:
+        temp_raw_val = raw_volume_l_per_h
+
+    # --- ЛОГІКА ЗГЛАДЖУВАННЯ ОСНОВНОГО ПОКАЗНИКА ---
+    global main_val_buffer, last_display_unit
+    current_unit = "L/100KM" if can_show_l100km else "L/H"
+
+    # Якщо одиниці виміру перемкнулися, очищаємо буфер згладжування, щоб уникнути "каші".
+    if current_unit != last_display_unit:
+        main_val_buffer = [temp_raw_val] * Settings.MAIN_VAL_BUFFER_SIZE
+        last_display_unit = current_unit
+
+    # Додаємо нове значення до буфера та обчислюємо згладжене середнє.
+    main_val_buffer.pop(0)
+    main_val_buffer.append(temp_raw_val)
+    smoothed_val = sum(main_val_buffer) / len(main_val_buffer)
+
+    # 3. Накопичення і збереження даних поїздок.
+    # TRIP накопичується, якщо двигун стабільний.
     trip_fuel_consumed_L += volume_L_current_interval
     trip_distance_travelled_km += distance_km_current_interval
 
+    # PERS накопичується лише, якщо швидкість вище певного порогу.
     if current_speed_kmh >= Settings.MIN_SPEED_FOR_PERS_COUNT_KMH:
         persistent_trip_fuel_L += volume_L_current_interval
         persistent_trip_distance_km += distance_km_current_interval
 
-    reset_persistent_trip();  save_persistent_data()
+    # Перевірка на автоматичне скидання PERS та збереження даних.
+    reset_persistent_trip()
+    save_persistent_data()
 
-    # 5. Обробка помилок
-    # Оновлення згладженого значення палива перед перевіркою помилок
-    process_fuel_smoothing() # Викликаємо тут, щоб last_smoothed_fuel_percent був актуальним
-    real_sensor_errors = check_errors()
+    # 4. Обробка помилок (ІГНОРУЄТЬСЯ, ЯКЩО АКТИВНИЙ СПЕЦІАЛЬНИЙ ЕКРАН).
+    if current_display_mode != "SPECIAL_SCREEN":
+        # 4.1. Оновлення значення палива та перевірка всіх датчиків.
+        process_fuel_smoothing()
+        real_sensor_errors = check_errors()
 
-    # Визначаємо, чи є критичні помилки
-    has_critical_errors = any(err['text'] in ALL_SOUND_TRIGGERING_ERROR_TEXTS for err in real_sensor_errors)
-    # Визначаємо, чи є помилка "Мало палива"
-    has_low_fuel_error = any(err['text'] == Icons.ERROR_ICONS['LOW_FUEL']['text'] for err in real_sensor_errors)
+        # 4.2. Визначення критичності знайдених помилок.
+        has_critical_errors = any(err['text'] in ALL_SOUND_TRIGGERING_ERROR_TEXTS for err in real_sensor_errors)
+        has_low_fuel_error = any(err['text'] == Icons.ERROR_ICONS['LOW_FUEL']['text'] for err in real_sensor_errors)
 
-    errors_to_show_based_on_sensors = []
-    if has_critical_errors:
-        # Якщо є критичні помилки, відображаємо їх (ігноруючи "Мало палива")
-        errors_to_show_based_on_sensors = [err for err in real_sensor_errors if err['text'] in ALL_SOUND_TRIGGERING_ERROR_TEXTS]
-        if 'WARNING' in Icons.ERROR_ICONS:
-            errors_to_show_based_on_sensors.append(Icons.ERROR_ICONS['WARNING'])
-    elif has_low_fuel_error:
-        # Якщо є тільки "Мало палива", активуємо його спеціальний цикл відображення
-        errors_to_show_based_on_sensors = [Icons.ERROR_ICONS['LOW_FUEL']]
-    else:
-        # Немає активних помилок
-        errors_to_show_based_on_sensors = [Icons.ERROR_ICONS['NONE']]
+        errors_to_show_based_on_sensors = []
+        if has_critical_errors:
+            errors_to_show_based_on_sensors = [err for err in real_sensor_errors if err['text'] in ALL_SOUND_TRIGGERING_ERROR_TEXTS]
+            if 'WARNING' in Icons.ERROR_ICONS:
+                errors_to_show_based_on_sensors.append(Icons.ERROR_ICONS['WARNING'])
+        elif has_low_fuel_error:
+            errors_to_show_based_on_sensors = [Icons.ERROR_ICONS['LOW_FUEL']]
+        else:
+            errors_to_show_based_on_sensors = [Icons.ERROR_ICONS['NONE']]
 
-    # 5.2. ЛОГІКА ФІКСАЦІЇ ТА ЧЕРГИ ПОМИЛОК (LATCH QUEUE)
-    current_severity = _get_error_severity_level(active_errors)
-    new_severity = _get_error_severity_level(errors_to_show_based_on_sensors)
+        # 4.3. ЛОГІКА ФІКСАЦІЇ ТА ЧЕРГИ ПОМИЛОК
+        current_severity = _get_error_severity_level(active_errors)
+        new_severity = _get_error_severity_level(errors_to_show_based_on_sensors)
 
-    # Визначення інтервалу циклу залежить від критичності помилок
-    current_cycle_interval = Settings.ERROR_DISPLAY_CYCLE_MS # Для всіх помилок
+        # Прибрати негайний вихід при зникненні помилок (new_severity == 0)
+        should_switch_immediately = (new_severity > current_severity) or \
+                                    (current_severity == 0 and new_severity > 0)
 
-    # Умови для НЕГАЙНОГО перемикання екрану помилок
-    should_switch_immediately = new_severity > current_severity or \
-                                (current_severity == 0 and new_severity > 0) or \
-                                (active_errors == [Icons.ERROR_ICONS['NONE']] and errors_to_show_based_on_sensors != [Icons.ERROR_ICONS['NONE']]) or \
-                                (new_severity == 0 and current_severity > 0) # Перехід з будь-якої помилки на NONE
+        if should_switch_immediately:
+            if active_errors != errors_to_show_based_on_sensors:
+                active_errors = errors_to_show_based_on_sensors[:]
+                _queued_errors_for_next_cycle = []
+                current_error_display_index = 0
+                last_error_cycle_time_ms = current_time_ms
+                low_fuel_display_state = 0
+                low_fuel_last_state_change_time_ms = current_time_ms
+        elif active_errors != errors_to_show_based_on_sensors:
+            if errors_to_show_based_on_sensors != _queued_errors_for_next_cycle:
+                _queued_errors_for_next_cycle = errors_to_show_based_on_sensors[:]
 
-    if should_switch_immediately:
-        if active_errors != errors_to_show_based_on_sensors:
-            active_errors = errors_to_show_based_on_sensors[:]
-            _queued_errors_for_next_cycle = []
-            current_error_display_index = 0
-            last_error_cycle_time_ms = current_time_ms
-            # Скидаємо стан відображення "Мало палива" при негайному перемиканні
-            low_fuel_display_state = 0
-            low_fuel_last_state_change_time_ms = current_time_ms
-    elif active_errors != errors_to_show_based_on_sensors:
-        if errors_to_show_based_on_sensors != _queued_errors_for_next_cycle:
-            _queued_errors_for_next_cycle = errors_to_show_based_on_sensors[:]
+        # Перевіряємо завершення циклу
+        time_since_last_switch = time.ticks_diff(current_time_ms, last_error_cycle_time_ms)
+        is_cycle_complete = (time_since_last_switch >= Settings.ERROR_DISPLAY_CYCLE_MS) and \
+                            (current_error_display_index >= len(active_errors) - 1)
 
-    time_since_last_switch = time.ticks_diff(current_time_ms, last_error_cycle_time_ms)
-    is_cycle_complete = (time_since_last_switch >= current_cycle_interval) and \
-                        (current_error_display_index == len(active_errors) - 1)
+        # Якщо помилок більше немає, ми чекаємо завершення циклу, перш ніж поставити NONE
+        if is_cycle_complete:
+            if _queued_errors_for_next_cycle:
+                active_errors = _queued_errors_for_next_cycle[:]
+                _queued_errors_for_next_cycle = []
+                current_error_display_index = 0
+                last_error_cycle_time_ms = current_time_ms
+            elif errors_to_show_based_on_sensors == [Icons.ERROR_ICONS['NONE']] and active_errors != [Icons.ERROR_ICONS['NONE']]:
+                active_errors = [Icons.ERROR_ICONS['NONE']]
+                current_error_display_index = 0
 
-    if is_cycle_complete and _queued_errors_for_next_cycle:
-        active_errors = _queued_errors_for_next_cycle[:]
-        _queued_errors_for_next_cycle = []
-        current_error_display_index = 0
-        last_error_cycle_time_ms = current_time_ms
-        # Скидаємо стан відображення "Мало палива" при перемиканні з черги
-        low_fuel_display_state = 0
-        low_fuel_last_state_change_time_ms = current_time_ms
-
-    # 5.3. Керування ЗВУКОМ та БЛИМАННЯМ
-    # Звук активується тільки для критичних помилок (рівень 3)
-    loud_alarm_needed = (_get_error_severity_level(active_errors) == 3)
-
-    if pwm_speaker:
-        if loud_alarm_needed and not sensor_alarm_active:
-            sensor_alarm_active = True
-            alarm_phase = 0; alarm_phase_start_time_ms = 0
-            if pwm_speaker.freq() != Settings.ALARM_SEQUENCE[0][1]:
-                 pwm_speaker.freq(Settings.ALARM_SEQUENCE[0][1])
-            pwm_speaker.duty_u16(32768)
-            current_speaker_freq = Settings.ALARM_SEQUENCE[0][1]
-            current_speaker_duty = 32768
-        elif not loud_alarm_needed and sensor_alarm_active:
+        # Оновлюємо current_display_mode ТІЛЬКИ на основі АКТУАЛЬНО відображуваних (active_errors)
+        if active_errors == [Icons.ERROR_ICONS['NONE']]:
+            current_display_mode = "MAIN"
             sensor_alarm_active = False
+        elif any(err['text'] == Icons.ERROR_ICONS['LOW_FUEL']['text'] for err in active_errors) and not has_critical_errors:
+            current_display_mode = "LOW_FUEL_CYCLE"
+            sensor_alarm_active = False
+        else:
+            current_display_mode = "ERROR_CYCLE"
+            # Звук працює по активній помилці
+            if pwm_speaker:
+                if _get_error_severity_level(active_errors) == 3:
+                    if not sensor_alarm_active:
+                        sensor_alarm_active = True
+                        alarm_phase = 0; alarm_phase_start_time_ms = 0
+                        if pwm_speaker.freq() != Settings.ALARM_SEQUENCE[0][1]:
+                             pwm_speaker.freq(Settings.ALARM_SEQUENCE[0][1])
+                        pwm_speaker.duty_u16(32768)
+                else:
+                    sensor_alarm_active = False
+    # 4.4. Керування ЗВУКОМ та БЛИМАННЯМ (за межами ігнорування спец-екрану).
+    manage_sensor_alarm() # Керуємо послідовністю звукових сигналів.
 
-    manage_sensor_alarm()
-
+    # Перемикання стану блимання для візуальних ефектів.
     if time.ticks_diff(current_time_ms, last_blink_toggle_time_ms) >= Settings.BLINK_INTERVAL_MS:
         blink_on = not blink_on
         last_blink_toggle_time_ms = current_time_ms
 
-    # 5.4. Відображення на OLED
-    if oled_status != "OK" or oled is None: return
+    # 4.5. Відображення на OLED дисплеї.
+    if oled_status != "OK" or oled is None:
+        return # Якщо OLED не працює, нічого не відображаємо.
 
-    # --- СПЕЦІАЛЬНА ЛОГІКА ДЛЯ ВІДОБРАЖЕННЯ "МАЛО ПАЛИВА" ---
-    current_error_severity = _get_error_severity_level(active_errors)
-    if current_error_severity == 1 and active_errors[0]['text'] == Icons.ERROR_ICONS['LOW_FUEL']['text']:
-        # Ми в стані відображення "Мало палива"
+    # --- ЛОГІКА ВІДОБРАЖЕННЯ НА ОСНОВІ current_display_mode ---
+    if current_display_mode == "SPECIAL_SCREEN":
+        # Перевірка часу для спеціального екрану.
+        if time.ticks_diff(current_time_ms, special_screen_active_time_ms) >= Settings.SPECIAL_SCREEN_DISPLAY_DURATION_MS:
+            # Час спец-екрану вийшов, повертаємося до попереднього режиму.
+            # Визначаємо, чи є помилки, щоб повернутися на екран помилок або на головний.
+            temp_errors = check_errors() # Повторно перевіряємо помилки.
+            if temp_errors != [Icons.ERROR_ICONS['NONE']] and any(err['text'] in ALL_SOUND_TRIGGERING_ERROR_TEXTS for err in temp_errors):
+                current_display_mode = "ERROR_CYCLE"
+            elif any(err['text'] == Icons.ERROR_ICONS['LOW_FUEL']['text'] for err in temp_errors):
+                current_display_mode = "LOW_FUEL_CYCLE"
+            else:
+                current_display_mode = "MAIN"
+            # Скидаємо прапорці обробки кнопки, щоб вона знову реагувала.
+            button_trip_reset_triggered = False
+            button_special_screen_triggered = False
+            button_special_screen_beep_played = False
+            # Запобігаємо повторному скиданню, якщо кнопка все ще утримується.
+            if button_press_timer_start != 0:
+                button_press_timer_start = 0
+
+        else:
+            # Якщо спец-екран активний, малюємо його.
+            draw_special_screen(oled, current_speed_kmh, get_current_rpm_atomic(), last_smoothed_fuel_percent)
+            return # Виходимо, оскільки екран вже намальовано.
+
+    elif current_display_mode == "LOW_FUEL_CYCLE":
+        # Ми перебуваємо в стані "Мало палива", що має спеціальний цикл відображення.
         time_since_low_fuel_state_change = time.ticks_diff(current_time_ms, low_fuel_last_state_change_time_ms)
 
-        if low_fuel_display_state == 0: # Стан: Показуємо "Мало палива"
+        if low_fuel_display_state == 0: # Стан: Показуємо іконку "Мало палива".
             if time_since_low_fuel_state_change >= Settings.LOW_FUEL_DISPLAY_DURATION_MS:
-                low_fuel_display_state = 1 # Переходимо до показу головного екрану
+                low_fuel_display_state = 1 # Переходимо до показу головного екрану.
                 low_fuel_last_state_change_time_ms = current_time_ms
 
-            oled.fill(0)
-            icon_to_draw = Icons.ERROR_ICONS['LOW_FUEL'] # Завжди показуємо іконку "Мало палива"
+            oled.fill(0) # Очищаємо дисплей.
+            icon_to_draw = Icons.ERROR_ICONS['LOW_FUEL']
             if icon_to_draw['icon'] is not None:
                 icon_fb = framebuf.FrameBuffer(icon_to_draw['icon'], icon_to_draw['width'], icon_to_draw['height'], framebuf.MONO_HLSB)
                 oled.blit(icon_fb, icon_to_draw['icon_pos'][0], icon_to_draw['icon_pos'][1])
-            if file_error_count > 0: # Додаємо відображення помилок файлу, якщо є
+                # Отримуємо координати
+                coords = icon_to_draw.get('icon_pos', (3, 3))
+                ix, iy = coords[0], coords[1]
+                # Малюємо іконку
+                oled.blit(icon_fb, ix, iy)
+                # Розраховуємо реальні літри
+                f_L_real = (last_smoothed_fuel_percent / 100) * Settings.FUEL_TANK_CAPACITY_L
+                fuel_num = int(f_L_real)
+                # Логіка вибору тексту
+                if fuel_num > 9:
+                    fuel_txt = ">"
+                else:
+                    fuel_txt = f"{fuel_num}L"
+                # Вивід на екран
+                ix, iy = icon_to_draw.get('icon_pos', (3, 3))
+                # Координати центру
+                if fuel_txt == ">":
+                    text_x = ix + 38 # Для центрування >
+                else:
+                    text_x = ix + 29 # Для цифри з L
+                oled.large_text(fuel_txt, text_x, iy + 60, 3, 0)
+            if file_error_count > 0: # Додаємо відображення помилок файлу, якщо є.
                 error_display_text = f"FE:{file_error_count}"
                 text_w = len(error_display_text) * 8
-                oled.text(error_display_text, 108 - text_w, 0, 1)
+                oled.text(error_display_text, 128 - text_w - 4, 0, 1)
             oled.show()
 
-        elif low_fuel_display_state == 1:  # Стан: Показуємо головний екран
+        elif low_fuel_display_state == 1:  # Стан: Показуємо головний екран.
             if time_since_low_fuel_state_change >= Settings.LOW_FUEL_MAIN_SCREEN_DURATION_MS:
-                low_fuel_display_state = 0  # Переходимо до показу "Мало палива"
+                low_fuel_display_state = 0  # Переходимо назад до показу іконки "Мало палива".
                 low_fuel_last_state_change_time_ms = current_time_ms
 
             oled.fill(0)
-            draw_main_screen(
+            draw_main_screen( # Малюємо головний екран.
                 oled,
                 distance_km_current_interval,
                 volume_L_current_interval,
                 current_speed_kmh,
-                interval_sec
+                interval_sec,
+                display_value=smoothed_val
             )
-
-            # Показуємо лічильник файлових помилок також на головному екрані
+            # Показуємо лічильник файлових помилок також на головному екрані.
             if file_error_count > 0:
                 error_display_text = f"FE:{file_error_count}"
                 text_w = len(error_display_text) * 8
-                oled.text(error_display_text, 108 - text_w, 0, 1)
+                oled.text(error_display_text, 128 - text_w - 4, 0, 1)
 
             oled.show()
-        return  # Важливо: виходимо, бо спеціальна low fuel-логіка вже все намалювала
+        return  # Важливо: виходимо з функції, оскільки логіка "Мало палива" вже все намалювала.
 
-    # --- СТАНДАРТНА ЛОГІКА ВІДОБРАЖЕННЯ (для головного екрану або критичних помилок) ---
-    if active_errors == [Icons.ERROR_ICONS['NONE']]:
+    elif current_display_mode == "MAIN":
+        # Якщо немає активних помилок, показуємо головний екран.
         oled.fill(0)
-        draw_main_screen(oled, distance_km_current_interval, volume_L_current_interval, current_speed_kmh, interval_sec)
+        draw_main_screen(oled, distance_km_current_interval, volume_L_current_interval, current_speed_kmh, interval_sec,
+        display_value=smoothed_val)
         oled.show()
         return
 
-    display_cycle_interval = Settings.ERROR_DISPLAY_CYCLE_MS
+    elif current_display_mode == "ERROR_CYCLE":
+        # Якщо є інші (критичні) помилки, циклічно відображаємо їх іконки.
+        # Переконаємося, що індекс не виходить за межі списку.
+        if current_error_display_index >= len(active_errors):
+            current_error_display_index = 0
 
-    if current_error_display_index >= len(active_errors):
-        current_error_display_index = 0
+        error_to_display = active_errors[current_error_display_index]
+        oled.fill(0)
 
-    error_to_display = active_errors[current_error_display_index]
-    oled.fill(0)
+        # Перемикаємося до наступної помилки в списку через заданий інтервал.
+        if time.ticks_diff(current_time_ms, last_error_cycle_time_ms) >= Settings.ERROR_DISPLAY_CYCLE_MS:
+            current_error_display_index = (current_error_display_index + 1) % len(active_errors)
+            last_error_cycle_time_ms = current_time_ms
 
-    if time.ticks_diff(current_time_ms, last_error_cycle_time_ms) >= display_cycle_interval:
-        current_error_display_index = (current_error_display_index + 1) % len(active_errors)
-        last_error_cycle_time_ms = current_time_ms
+        # Малюємо іконку поточної помилки.
+        if error_to_display['icon'] is not None:
+            icon_fb = framebuf.FrameBuffer(error_to_display['icon'], error_to_display['width'], error_to_display['height'], framebuf.MONO_HLSB)
+            oled.blit(icon_fb, error_to_display['icon_pos'][0], error_to_display['icon_pos'][1])
 
-    if error_to_display['icon'] is not None:
-        icon_fb = framebuf.FrameBuffer(error_to_display['icon'], error_to_display['width'], error_to_display['height'], framebuf.MONO_HLSB)
-        oled.blit(icon_fb, error_to_display['icon_pos'][0], error_to_display['icon_pos'][1])
+        # Додаємо відображення помилок файлу, якщо є.
+        if file_error_count > 0:
+            error_display_text = f"FE:{file_error_count}"
+            text_w = len(error_display_text) * 8
+            oled.text(error_display_text, 128 - text_w - 4, 0, 1)
 
-    if file_error_count > 0: # Додаємо відображення помилок файлу, якщо є
-        error_display_text = f"FE:{file_error_count}"
-        text_w = len(error_display_text) * 8
-        oled.text(error_display_text, 108 - text_w, 0, 1)
-
-    oled.show()
+        oled.show()
 
 # -------------------------------------------------------------------------
 # 9. ГОЛОВНИЙ ЦИКЛ (MAIN LOOP)
+#    Нескінченний цикл, що безперервно виконує основні функції програми.
 # -------------------------------------------------------------------------
 
-print("✅ БК запущено: Audi 80 Mono Motronic-1.2.3 2.0E")
-
+print("✅ Бортовий Комп'ютер запущено: Audi 80 Mono Motronic v1.2.3")
 while True:
-    if RESET_BUTTON_PIN.value() == 0:
-        trip_fuel_consumed_L = 0.0
-        trip_distance_travelled_km = 0.0
-        if 'pwm_speaker' in globals() and pwm_speaker:
-            pwm_speaker.freq(2000)
-            pwm_speaker.duty_u16(32768)
-            time.sleep(0.1)
-            pwm_speaker.duty_u16(0)
-        while RESET_BUTTON_PIN.value() == 0:
-            time.sleep(0.01)
+    current_time_ms = time.ticks_ms()
 
+    # Оновлюємо напругу раз на секунду
+    if time.ticks_diff(current_time_ms, last_voltage_update_time_ms) > 1000:
+        update_voltage_correction()
+        last_voltage_update_time_ms = current_time_ms
+
+    # --- БЛОК ПЕРЕВІРКИ ЗУПИНКИ ДВИГУНА ---
+    # Якщо від форсунки немає сигналу більше заданого часу (ENGINE_STOP_TIMEOUT_MS),
+    # вважаємо, що двигун заглух.
+    if time.ticks_diff(current_time_ms, last_inj_activity_time_ms) > Settings.ENGINE_STOP_TIMEOUT_MS:
+        rpm = 0
+        is_engine_running = False
+        is_engine_running_stable = False
+        # ВАЖЛИВО: скидаємо час старту двигуна, щоб затримка перевірки тиску масла
+        # коректно спрацювала при наступному запуску.
+        engine_start_time_ms = 0
+
+    # --- БЛОК ОБРОБКИ КНОПКИ (Скидання TRIP / Спеціальний екран) ---
+    is_button_down = (RESET_BUTTON_PIN.value() == 0) # Читаємо поточний стан кнопки.
+    # current_time_ms вже визначена на початку циклу while True.
+
+    if is_button_down:
+        if button_press_timer_start == 0:
+            # Кнопка щойно натиснута. Запускаємо таймер.
+            button_press_timer_start = current_time_ms
+            button_trip_reset_candidate = False # Скидаємо прапорець кандидата на початку нового натискання.
+        else:
+            # Кнопка утримується, обчислюємо тривалість утримання.
+            hold_duration = time.ticks_diff(current_time_ms, button_press_timer_start)
+
+            # 1. Логіка для активації спеціального екрану (5 секунд утримання).
+            # Ця дія має найвищий пріоритет.
+            if hold_duration >= Settings.BUTTON_SPECIAL_SCREEN_HOLD_MS and not button_special_screen_triggered:
+                if not button_special_screen_beep_played:
+                    play_special_screen_beeps() # Відтворюємо подвійний сигнал.
+                    button_special_screen_beep_played = True
+
+                # Активація спец-екрану.
+                current_display_mode = "SPECIAL_SCREEN"
+                special_screen_active_time_ms = current_time_ms
+                button_special_screen_triggered = True
+                button_trip_reset_candidate = False # ВАЖЛИВО: якщо активується спец-екран, скидання TRIP скасовується.
+
+            # 2. Логіка для відстеження потенційного скидання TRIP (між 2 та 5 секундами утримання).
+            # Встановлюємо прапорець, що TRIP може бути скинутий, якщо кнопку відпустять
+            # у "вікні" між 2 та 5 секундами утримання, і спец-екран ще не активований.
+            elif hold_duration >= Settings.BUTTON_TRIP_RESET_HOLD_MS and \
+                 hold_duration < Settings.BUTTON_SPECIAL_SCREEN_HOLD_MS and \
+                 not button_special_screen_triggered:
+
+                button_trip_reset_candidate = True # Позначаємо, що TRIP є кандидатом на скидання.
+
+                if not button_trip_ready_beep_played:  # Якщо звук ще НЕ грав
+                    play_single_beep(Settings.BUTTON_TRIP_READY_BEEP_FREQ, Settings.BUTTON_TRIP_READY_BEEP_DURATION_SEC)
+                    button_trip_ready_beep_played = True  # ✅ БЛОКУВАННЯ повторів
+
+    else: # Кнопка відпущена.
+        if button_press_timer_start != 0: # Тільки якщо кнопка була натиснута раніше.
+            button_trip_ready_beep_played = False  # Готуємо для наступного натискання
+
+            # --- Фактичне скидання TRIP відбувається тут, при відпусканні кнопки. ---
+            # Умова:
+            # 1. `button_trip_reset_candidate` є True (означає, що кнопку тримали між 2 і 5 секундами).
+            # 2. Спец-екран НЕ був активований (`button_special_screen_triggered` False).
+            if button_trip_reset_candidate and not button_special_screen_triggered:
+                trip_fuel_consumed_L = 0.0
+                trip_distance_travelled_km = 0.0
+                print("🔄 TRIP RESET by button")
+                play_single_beep(Settings.BUTTON_TRIP_RESET_BEEP_FREQ, Settings.BUTTON_TRIP_RESET_BEEP_DURATION_SEC)
+
+            # Скидаємо всі прапорці та таймери для наступного натискання.
+            button_press_timer_start = 0
+            button_special_screen_triggered = False
+            button_special_screen_beep_played = False
+            button_trip_reset_candidate = False # Скидаємо для наступного натискання.
+            # Якщо спец-екран активувався по 5-секундному утриманню, він залишиться активним на 15 секунд.
+            # Якщо кнопка відпущена до 5 секунд, то спец-екран не активується.
+
+    # --- ОСНОВНИЙ БЛОК ВИКОНАННЯ ЛОГІКИ ---
     try:
         current_time = time.ticks_ms()
+        # Розраховуємо фактичний інтервал часу, що минув з останнього оновлення.
         actual_interval_sec = time.ticks_diff(current_time, last_display_update_time) / 1000.0
-        if actual_interval_sec == 0: actual_interval_sec = Settings.UPDATE_INTERVAL_SEC
+        if actual_interval_sec == 0: # Запобігаємо діленню на нуль або дуже малим інтервалам.
+            actual_interval_sec = Settings.UPDATE_INTERVAL_SEC
 
-        calculate_and_display(actual_interval_sec)
+        calculate_and_display(actual_interval_sec) # Виконуємо всі розрахунки та оновлення дисплея.
 
-        last_display_update_time = current_time
-        time.sleep(Settings.UPDATE_INTERVAL_SEC)
+        last_display_update_time = current_time # Оновлюємо час останнього оновлення дисплея.
+        time.sleep(Settings.UPDATE_INTERVAL_SEC) # Пауза до наступного циклу.
     except Exception as e:
+        # Обробка непередбачених помилок в головному циклі.
         print(f"Loop Error: {e}")
+        # Відображаємо "LOOP ERR" на дисплеї.
         if oled_status == "OK" and oled:
             oled.fill(0)
             oled.large_text(
@@ -879,8 +1467,8 @@ while True:
                 1
             )
             oled.show()
+        # Вимикаємо динамік, якщо він був активний.
         if pwm_speaker:
             pwm_speaker.duty_u16(0)
-            current_speaker_duty = 0 # Додано скидання стану динаміка
-        time.sleep(5)
-
+            current_speaker_duty = 0
+        time.sleep(5) # Пауза перед наступною спробою виконання циклу.
